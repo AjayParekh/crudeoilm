@@ -1,0 +1,10 @@
+streamlit>=1.32.0
+requests>=2.31.0
+pandas>=2.0.0
+beautifulsoup4
+pytz
+numpy
+streamlit-autorefresh
+openpyxl
+plotly>=5.18.0
+PyGithub
