@@ -245,7 +245,6 @@ def chain_from_instruments(spot):
     for s_ in strikes:
         ck, pk = by_strike[s_].get("CE"), by_strike[s_].get("PE")
         
-        # SAFE EXTRACTION: prevents 'NoneType' errors
         cq = (quotes.get(ck["key"]) if ck else None) or {}
         pq = (quotes.get(pk["key"]) if pk else None) or {}
         cg = (greeks.get(ck["key"]) if ck else None) or {}
@@ -290,7 +289,61 @@ def get_chain():
 chain, chain_err, chain_src, chain_raw = get_chain()
 
 # ==============================
-# ANALYTICS & SIGNALS
+# RESTORED: FUTURES OI FLOW LOGIC
+# ==============================
+def compute_crude_flow():
+    keys = [f["key"] for f in futs]
+    j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(keys)})
+    if j.get("status") != "success":
+        return {"score": 0.0, "rows": [], "err": json.dumps(j)[:300]}
+    q = {v.get("instrument_token"): v for v in (j.get("data") or {}).values()}
+
+    cache = st.session_state.setdefault("prev_oi", {})
+    for k in keys:
+        if (k, today_iso) not in cache:
+            ok, v = _fetch_prev_oi(k, today_iso)
+            if ok:
+                cache[(k, today_iso)] = v
+
+    big = flow_big_cr * 1e7
+    rows, wsum, wtot = [], 0.0, 0.0
+    for f in futs:
+        v = q.get(f["key"]) or {}
+        last, chg, oi = v.get("last_price") or 0, v.get("net_change") or 0, v.get("oi") or 0
+        prev_oi = cache.get((f["key"], today_iso))
+        if not last or prev_oi is None:
+            continue
+        lot = float(f.get("lot_size") or 10)
+        prev_px = last - chg
+        price_pct = chg / prev_px * 100 if prev_px else 0
+        cur_val = oi * lot * last
+        chg_abs = (oi - prev_oi) * lot * last
+        oi_pct = (oi - prev_oi) / prev_oi * 100 if prev_oi else 0
+        if cur_val < 100_000_000:
+            continue
+
+        score = 0.0
+        if chg_abs > big and price_pct < -0.3: score = -0.9
+        elif chg_abs > big and price_pct > 0.3: score = 0.9
+        elif oi_pct > flow_pct * 3 and price_pct < -0.3: score = -0.6
+        elif oi_pct > flow_pct and price_pct < -0.5: score = -0.4
+        elif oi_pct > flow_pct and price_pct > 0.5: score = 0.4
+
+        if oi_pct >= 0: label = "Long Buildup" if price_pct >= 0 else "Short Buildup"
+        else: label = "Short Covering" if price_pct >= 0 else "Long Unwinding"
+
+        weight = cur_val / 1e9
+        wsum += score * weight
+        wtot += weight
+        rows.append({"contract": f["symbol"], "price": last, "price_chg_%": round(price_pct, 2),
+                     "oi": oi, "prev_oi": prev_oi, "oi_chg_%": round(oi_pct, 2),
+                     "oi_value": cur_val, "oi_value_chg": chg_abs,
+                     "view": label, "score": score, "weight": round(weight, 3)})
+    final = max(-1, min(1, wsum / wtot)) if wtot else 0.0
+    return {"score": final, "rows": rows, "err": None}
+
+# ==============================
+# SIGNALS & ANALYTICS
 # ==============================
 def max_pain(df):
     best, low = None, float("inf")
@@ -336,10 +389,7 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         target_strike = df.loc[df["call_oi"].idxmax(), "strike"]
         if target_strike <= trigger_spot: target_strike = trigger_spot + 50
         opt_type = "CE"
-        opt_delta_col = "call_delta"
-        opt_symbol_col = "call_symbol"
-        opt_ltp_col = "call_ltp"
-        opt_iv_col = "call_iv"
+        opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "call_delta", "call_symbol", "call_ltp", "call_iv"
         reason = f"Bullish OI Flow. Put buildup at {top_row['strike']:g}."
     else:
         trigger_spot = top_row["strike"] - buffer
@@ -347,10 +397,7 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         target_strike = df.loc[df["put_oi"].idxmax(), "strike"]
         if target_strike >= trigger_spot: target_strike = trigger_spot - 50
         opt_type = "PE"
-        opt_delta_col = "put_delta"
-        opt_symbol_col = "put_symbol"
-        opt_ltp_col = "put_ltp"
-        opt_iv_col = "put_iv"
+        opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "put_delta", "put_symbol", "put_ltp", "put_iv"
         reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
 
     best_opt = None
@@ -367,15 +414,9 @@ def get_trade_setup(df, spot, buffer, lo, hi):
     if best_opt is None:
         best_opt = df.iloc[(df["strike"] - spot).abs().argsort()[:1]].iloc[0]
         
-    opt_premium = best_opt[opt_ltp_col]
-    if pd.isna(opt_premium) or opt_premium is None: opt_premium = 0.0
-    
-    opt_delta = best_opt[opt_delta_col]
-    if pd.isna(opt_delta) or opt_delta is None: opt_delta = 0.0
-    
-    opt_iv = best_opt[opt_iv_col]
-    if pd.isna(opt_iv) or opt_iv is None: opt_iv = 0.0
-    
+    opt_premium = best_opt[opt_ltp_col] if not pd.isna(best_opt[opt_ltp_col]) else 0.0
+    opt_delta = best_opt[opt_delta_col] if not pd.isna(best_opt[opt_delta_col]) else 0.0
+    opt_iv = best_opt[opt_iv_col] if not pd.isna(best_opt[opt_iv_col]) else 0.0
     opt_symbol = best_opt[opt_symbol_col] if best_opt[opt_symbol_col] else "Unknown"
     
     risk = abs(trigger_spot - sl_spot)
@@ -383,18 +424,10 @@ def get_trade_setup(df, spot, buffer, lo, hi):
     rr = round(reward / risk, 2) if risk > 0 else 0
 
     return {
-        "type": opt_type,
-        "symbol": opt_symbol,
-        "strike": best_opt["strike"],
-        "premium": opt_premium,
-        "delta": opt_delta,
-        "iv": opt_iv,
-        "entry_spot": trigger_spot,
-        "sl_spot": sl_spot,
-        "target_spot": target_strike,
-        "rr": rr,
-        "reason": reason,
-        "is_bullish": is_bullish
+        "type": opt_type, "symbol": opt_symbol, "strike": best_opt["strike"],
+        "premium": opt_premium, "delta": opt_delta, "iv": opt_iv,
+        "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_strike,
+        "rr": rr, "reason": reason, "is_bullish": is_bullish
     }
 
 # ==============================
@@ -410,7 +443,8 @@ spot = price["ltp"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
 
-c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+# Top Row: Price
+c1, c2, c3 = st.columns([2, 1, 1])
 with c1:
     st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut) · {price['src']}</div>
       <div class="big">{spot:,.2f}</div>
@@ -420,15 +454,6 @@ with c2:
     st.markdown(f"""<div class="card"><div style="color:#666">Day High</div><div style="font-size:1.2rem;font-weight:bold">{price['high'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
 with c3:
     st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
-with c4:
-    if chain is not None and not chain.empty:
-        sig = oi_signal(chain, spot)
-        kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
-        st.markdown(f"""<div class="pred {kls}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Macro OI Signal</div>
-          <div style="font-size:1.4rem;font-weight:800">{sig['direction']}</div>
-          <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
-    else:
-        st.warning("No Chain Data")
 
 st.markdown("---")
 
@@ -446,37 +471,10 @@ else:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
         border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
         
-        st.markdown(f"""
-        <div class="trade-card" style="background:{bg}; border-left-color:{border};">
-            <div class="trade-header">🟢 BUY {setup['symbol']} @ {setup['premium']:.2f}</div>
-            <div><b>Strategy:</b> {setup['reason']}</div>
-            
-            <div class="trade-grid">
-                <div class="trade-item">
-                    <div class="trade-label">Entry Trigger (Spot)</div>
-                    <div class="trade-value">{setup['entry_spot']:,.2f}</div>
-                </div>
-                <div class="trade-item">
-                    <div class="trade-label">Stop Loss (Spot)</div>
-                    <div class="trade-value">{setup['sl_spot']:,.2f}</div>
-                </div>
-                <div class="trade-item">
-                    <div class="trade-label">Target (Spot)</div>
-                    <div class="trade-value">{setup['target_spot']:,.2f}</div>
-                </div>
-                <div class="trade-item">
-                    <div class="trade-label">Risk / Reward</div>
-                    <div class="trade-value">1 : {setup['rr']}</div>
-                </div>
-            </div>
-            
-            <div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;">
-                <div>📊 <b>Delta:</b> {setup['delta']:.3f}</div>
-                <div>📈 <b>IV:</b> {setup['iv']:.1f}%</div>
-                <div>💰 <b>Lot Size:</b> {fut.get('lot_size', '—')}</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        # FIXED HTML: Tightly packed to prevent Markdown from treating it as a code block
+        card_html = f'<div class="trade-card" style="background:{bg}; border-left-color:{border};"><div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div><div><b>Strategy:</b> {setup["reason"]}</div><div class="trade-grid"><div class="trade-item"><div class="trade-label">Entry Trigger (Spot)</div><div class="trade-value">{setup["entry_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Stop Loss (Spot)</div><div class="trade-value">{setup["sl_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Target (Spot)</div><div class="trade-value">{setup["target_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Risk / Reward</div><div class="trade-value">1 : {setup["rr"]}</div></div></div><div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;"><div>📊 <b>Delta:</b> {setup["delta"]:.3f}</div><div>📈 <b>IV:</b> {setup["iv"]:.1f}%</div><div>💰 <b>Lot Size:</b> {fut.get("lot_size", "—")}</div></div></div>'
+        
+        st.markdown(card_html, unsafe_allow_html=True)
         
         if (spot >= setup["entry_spot"] and setup["is_bullish"]) or (spot <= setup["entry_spot"] and not setup["is_bullish"]):
             st.success("🔥 **ENTRY ACTIVE:** Spot price has hit the trigger! You can enter this trade now.")
@@ -489,9 +487,37 @@ else:
 st.markdown("---")
 
 # ==============================
-# TABLES & CHARTS
+# RESTORED: FUTURES OI FLOW UI
+# ==============================
+flow = compute_crude_flow()
+if flow["rows"]:
+    st.subheader(f"🌊 CRUDEOILM Futures OI Flow — Macro Score: {flow['score']:.2f}")
+    bias = "Bullish" if flow["score"] > 0 else ("Bearish" if flow["score"] < 0 else "Sideways")
+    st.markdown(f"**Market Bias:** {bias}")
+    st.dataframe(pd.DataFrame(flow["rows"]))
+else:
+    st.info("Futures OI flow not available (no futures contract met the OI-value threshold).")
+
+st.markdown("---")
+
+# ==============================
+# CHARTS & TABLES
 # ==============================
 if chain is not None and not chain.empty:
+    # Signal Box
+    sig = oi_signal(chain, spot)
+    kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
+    st.markdown(f"""<div class="pred {kls}" style="padding:10px;margin-bottom:12px"><div style="opacity:.8">Macro Option Chain Signal</div>
+      <div style="font-size:1.4rem;font-weight:800">{sig['direction']}</div>
+      <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("PCR", f"{sig['pcr']:.2f}")
+    m2.metric("Max Pain", f"{sig['max_pain']:,.0f}")
+    m3.metric("Support (max Put OI)", f"{sig['support']:,.0f}")
+    m4.metric("Resistance (max Call OI)", f"{sig['resistance']:,.0f}")
+    m5.metric("Net ΔOI Calls / Puts", f"{sig['net_c']:+,.0f} / {sig['net_p']:+,.0f}")
+
     st.subheader("Open Interest by Strike")
     st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
     
