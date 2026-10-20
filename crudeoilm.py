@@ -244,10 +244,12 @@ def chain_from_instruments(spot):
     rows = []
     for s_ in strikes:
         ck, pk = by_strike[s_].get("CE"), by_strike[s_].get("PE")
-        cq = quotes.get(ck["key"]) if ck else {}
-        pq = quotes.get(pk["key"]) if pk else {}
-        cg = greeks.get(ck["key"]) if ck else {}
-        pg = greeks.get(pk["key"]) if pk else {}
+        
+        # SAFE EXTRACTION: prevents 'NoneType' errors
+        cq = (quotes.get(ck["key"]) if ck else None) or {}
+        pq = (quotes.get(pk["key"]) if pk else None) or {}
+        cg = (greeks.get(ck["key"]) if ck else None) or {}
+        pg = (greeks.get(pk["key"]) if pk else None) or {}
         
         c_oi = cq.get("oi") or 0
         p_oi = pq.get("oi") or 0
@@ -273,10 +275,17 @@ def chain_from_instruments(spot):
 
 def get_chain():
     if not opt_expiry: return None, "No expiry", "none", ""
-    df, raw = chain_from_option_api()
-    if df is not None: return df, None, "Upstox option-chain API", raw
-    df, err = chain_from_instruments(price["ltp"] if price else 0)
-    return df, err, "Instrument master + quotes", raw
+    try:
+        df, raw = chain_from_option_api()
+        if df is not None: return df, None, "Upstox option-chain API", raw
+    except Exception as e:
+        raw = f"Option Chain API Error: {e}"
+        
+    try:
+        df, err = chain_from_instruments(price["ltp"] if price else 0)
+        return df, err, "Instrument master + quotes", raw
+    except Exception as e:
+        return None, str(e), "Error", raw
 
 chain, chain_err, chain_src, chain_raw = get_chain()
 
@@ -314,26 +323,18 @@ def get_trade_setup(df, spot, buffer, lo, hi):
     d = df[df["has_chg"]].copy()
     if d.empty: return None
     
-    # Find the strike with the maximum OI change
     d["diff"] = (d["put_chg"] - d["call_chg"]).abs()
     d = d.sort_values("diff", ascending=False)
     if d.empty: return None
     
     top_row = d.iloc[0]
-    
-    # Determine Direction
-    # If Put Change > Call Change -> Bullish -> Buy CE
-    # If Call Change > Put Change -> Bearish -> Buy PE
     is_bullish = top_row["put_chg"] > top_row["call_chg"]
     
-    # Find target strike for SL/Target calculation
     if is_bullish:
-        # Support is at top_row['strike']
         trigger_spot = top_row["strike"] + buffer
         sl_spot = top_row["strike"] - buffer
-        # Target is the highest Call OI strike (Resistance)
         target_strike = df.loc[df["call_oi"].idxmax(), "strike"]
-        if target_strike <= trigger_spot: target_strike = trigger_spot + 50 # Fallback
+        if target_strike <= trigger_spot: target_strike = trigger_spot + 50
         opt_type = "CE"
         opt_delta_col = "call_delta"
         opt_symbol_col = "call_symbol"
@@ -341,12 +342,10 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         opt_iv_col = "call_iv"
         reason = f"Bullish OI Flow. Put buildup at {top_row['strike']:g}."
     else:
-        # Resistance is at top_row['strike']
         trigger_spot = top_row["strike"] - buffer
         sl_spot = top_row["strike"] + buffer
-        # Target is the highest Put OI strike (Support)
         target_strike = df.loc[df["put_oi"].idxmax(), "strike"]
-        if target_strike >= trigger_spot: target_strike = trigger_spot - 50 # Fallback
+        if target_strike >= trigger_spot: target_strike = trigger_spot - 50
         opt_type = "PE"
         opt_delta_col = "put_delta"
         opt_symbol_col = "put_symbol"
@@ -354,30 +353,31 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         opt_iv_col = "put_iv"
         reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
 
-    # Find the best option strike based on Delta and ATM proximity
-    # We look for an option where abs(delta) is within the band [lo, hi], closest to spot
     best_opt = None
     min_dist = float("inf")
     
     for _, row in df.iterrows():
         delta = abs(row[opt_delta_col])
-        # Filter by delta band
         if lo <= delta <= hi:
             dist = abs(row["strike"] - spot)
             if dist < min_dist:
                 min_dist = dist
                 best_opt = row
 
-    # Fallback if no option matches the delta band, just pick ATM
     if best_opt is None:
         best_opt = df.iloc[(df["strike"] - spot).abs().argsort()[:1]].iloc[0]
         
     opt_premium = best_opt[opt_ltp_col]
-    opt_symbol = best_opt[opt_symbol_col]
-    opt_delta = best_opt[opt_delta_col]
-    opt_iv = best_opt[opt_iv_col]
+    if pd.isna(opt_premium) or opt_premium is None: opt_premium = 0.0
     
-    # Calculate Risk Reward on Spot
+    opt_delta = best_opt[opt_delta_col]
+    if pd.isna(opt_delta) or opt_delta is None: opt_delta = 0.0
+    
+    opt_iv = best_opt[opt_iv_col]
+    if pd.isna(opt_iv) or opt_iv is None: opt_iv = 0.0
+    
+    opt_symbol = best_opt[opt_symbol_col] if best_opt[opt_symbol_col] else "Unknown"
+    
     risk = abs(trigger_spot - sl_spot)
     reward = abs(target_strike - trigger_spot)
     rr = round(reward / risk, 2) if risk > 0 else 0
@@ -410,7 +410,6 @@ spot = price["ltp"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
 
-# Top Row: Price & Signal
 c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
 with c1:
     st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut) · {price['src']}</div>
@@ -447,7 +446,6 @@ else:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
         border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
         
-        # Build Trade Card HTML
         st.markdown(f"""
         <div class="trade-card" style="background:{bg}; border-left-color:{border};">
             <div class="trade-header">🟢 BUY {setup['symbol']} @ {setup['premium']:.2f}</div>
@@ -480,7 +478,7 @@ else:
         </div>
         """, unsafe_allow_html=True)
         
-        if spot >= setup["entry_spot"] if setup["is_bullish"] else spot <= setup["entry_spot"]:
+        if (spot >= setup["entry_spot"] and setup["is_bullish"]) or (spot <= setup["entry_spot"] and not setup["is_bullish"]):
             st.success("🔥 **ENTRY ACTIVE:** Spot price has hit the trigger! You can enter this trade now.")
         else:
             st.info("⏳ **PENDING:** Waiting for Spot price to hit the Entry Trigger.")
