@@ -22,12 +22,9 @@ now = dt.datetime.now(IST)
 today = now.date()
 
 # ==============================
-# TOKEN  (never hardcode it)
-# Put in .streamlit/secrets.toml:  UPSTOX_TOKEN = "eyJ0eXAi..."
-# or set env var UPSTOX_TOKEN, or paste in the sidebar.
+# TOKEN
 # ==============================
 DEFAULT_TOKEN = "Bearer eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIxMDM2NjciLCJqdGkiOiI2OWQyMzJlMWNjZDUyZDRjZDQzMzc5NjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc3NTM4MzI2NSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODA2OTYyNDAwfQ.VFRZ5NP87NM1Vyn4-bCB2FAvanu4wsueNHo_POQtPv8"
-
 
 def get_token():
     tok = None
@@ -51,26 +48,34 @@ st.markdown("""
 .bullish{background:linear-gradient(135deg,#11998e,#38ef7d)}
 .bearish{background:linear-gradient(135deg,#cb2d3e,#ef473a)}
 .neutral{background:linear-gradient(135deg,#2c3e50,#4ca1af)}
-.entry{padding:14px 18px;border-radius:12px;margin-bottom:14px;border-left:6px solid}
 .pill{display:inline-block;padding:3px 12px;border-radius:20px;font-size:.8rem;font-weight:600;
       background:#e9ecef;color:#333;margin-right:6px}
+.trade-card{padding:20px;border-radius:12px;margin-bottom:14px;border-left:8px solid;color:white;box-shadow: 0 4px 15px rgba(0,0,0,0.2);}
+.trade-header{font-size:1.8rem;font-weight:900;margin-bottom:10px;}
+.trade-grid{display:grid; grid-template-columns: repeat(4, 1fr); gap: 15px; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; margin-top: 10px;}
+.trade-item{text-align:center;}
+.trade-label{font-size:0.8rem; opacity:0.8; text-transform:uppercase; letter-spacing:1px;}
+.trade-value{font-size:1.3rem; font-weight:bold;}
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================
-# SIDEBAR (settings only)
+# SIDEBAR
 # ==============================
 with st.sidebar:
     st.title("🛢️ CRUDEOILM Settings")
     st.markdown(f"### 🕒 IST: {now.strftime('%H:%M:%S')}")
     if not get_token():
         st.text_input("Upstox token (Bearer ...)", type="password", key="tok_input")
-    buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1)
+    
+    st.markdown("**Risk Management**")
+    buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1, help="Distance from the OI wall to trigger entry")
     min_gap = st.number_input("Min entry–exit gap (points)", 5, 500, 30, 5)
-    delta_lo, delta_hi = st.slider("Delta band", 0.05, 0.95, (0.15, 0.75), 0.05)
+    delta_lo, delta_hi = st.slider("Option Delta Band", 0.05, 0.95, (0.30, 0.75), 0.05, help="Select ATM/OTM strikes based on Delta")
+    
+    st.markdown("**Analytics**")
     top_n = st.slider("Rows in OI tables", 5, 40, 20, 5)
-    strike_window = st.slider("Strikes each side of price (for change in OI / Greeks)", 5, 40, 20, 5)
-    st.markdown("**OI Flow score**")
+    strike_window = st.slider("Strikes each side of price (for Greeks)", 5, 40, 20, 5)
     flow_big_cr = st.number_input("Big OI value change (₹ crore)", 1.0, 500.0, 10.0, 1.0)
     flow_pct = st.slider("OI % change threshold", 2, 50, 10, 1)
 
@@ -83,7 +88,6 @@ if not TOKEN.startswith("Bearer "):
 
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": TOKEN}
 
-
 def api_get(path, params):
     r = requests.get("https://api.upstox.com" + path, params=params, headers=HEADERS, timeout=15)
     try:
@@ -91,13 +95,11 @@ def api_get(path, params):
     except Exception:
         return {"status": "error", "errors": [{"message": r.text[:300]}]}
 
-
 # ==============================
-# INSTRUMENT MASTER (MCX) -> futures + option expiries
+# INSTRUMENT MASTER
 # ==============================
 def ms_to_date(ms):
     return dt.datetime.fromtimestamp(ms / 1000, IST).date()
-
 
 @st.cache_data(ttl=6 * 3600)
 def load_crude_instruments():
@@ -120,7 +122,6 @@ def load_crude_instruments():
             })
     return keep
 
-
 try:
     ins = load_crude_instruments()
 except Exception as e:
@@ -130,64 +131,31 @@ except Exception as e:
 today_iso = today.isoformat()
 futs = sorted([i for i in ins if i["type"] == "FUT" and i["expiry"] >= today_iso], key=lambda x: x["expiry"])
 if not futs:
-    st.error("No active CRUDEOILM futures found in the instrument file.")
+    st.error("No active CRUDEOILM futures found.")
     st.stop()
 
-# =========================================================
-# SIDEBAR: AUTO-SELECT nearest active Futures + Option expiry
-# =========================================================
+# AUTO-SELECT Futures and Options
 with st.sidebar:
     st.markdown("---")
-
-    # ---- Futures contract ----
-    # `futs` is already sorted by expiry ascending and filtered to >= today,
-    # so futs[0] is the nearest active contract. We default to it, but
-    # respect a manual override that is still valid.
     fut_labels = {f"{f['symbol']} (exp {f['expiry']})": f for f in futs}
-    fut_label_list = list(fut_labels.keys())
-
-    # Drop stale override (e.g. the chosen contract expired)
     if "fut_selector" in st.session_state and st.session_state.fut_selector not in fut_labels:
         del st.session_state.fut_selector
-
-    sel_fut_label = st.selectbox(
-        "Futures contract (price)",
-        fut_label_list,
-        index=0,                                   # nearest active by default
-        key="fut_selector",                        # persists manual override across refreshes
-        help="Auto-selects the nearest active contract. Override manually if needed.",
-    )
+    sel_fut_label = st.selectbox("Futures contract (price)", list(fut_labels.keys()), index=0, key="fut_selector")
     fut = fut_labels[sel_fut_label]
 
-    # ---- Option expiry for the chosen futures ----
-    opt_expiries = sorted({
-        i["expiry"] for i in ins
-        if i["type"] in ("CE", "PE")
-        and i["underlying_key"] == fut["key"]
-        and i["expiry"] >= today_iso
-    })
-
+    opt_expiries = sorted({i["expiry"] for i in ins if i["type"] in ("CE", "PE") and i["underlying_key"] == fut["key"] and i["expiry"] >= today_iso})
     if opt_expiries:
-        # If the futures contract changed, the old expiry may not exist any more.
-        if "opt_expiry_selector" in st.session_state and \
-           st.session_state.opt_expiry_selector not in opt_expiries:
+        if "opt_expiry_selector" in st.session_state and st.session_state.opt_expiry_selector not in opt_expiries:
             del st.session_state.opt_expiry_selector
-
-        opt_expiry = st.selectbox(
-            "Option expiry (OI / Greeks)",
-            opt_expiries,
-            index=0,                               # nearest active by default
-            key="opt_expiry_selector",
-            help="Auto-selects the nearest active expiry. Override manually if needed.",
-        )
+        opt_expiry = st.selectbox("Option expiry (OI / Greeks)", opt_expiries, index=0, key="opt_expiry_selector")
     else:
         opt_expiry = None
-        st.warning("No option expiries found for this futures contract.")
+        st.warning("No option expiries found.")
 
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE  (Upstox quote, TradingView fallback)
+# PRICE
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -198,44 +166,26 @@ def get_price():
         ohlc = q.get("ohlc") or {}
         prev = round(last - chg, 2) if last else (ohlc.get("close") or 0)
         pct = (chg / prev * 100) if prev else 0
-        return {"ltp": last, "chg": chg, "pct": pct, "prev": prev,
-                "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"),
-                "oi": q.get("oi"), "volume": q.get("volume"), "src": "Upstox"}
-    try:
-        r = requests.post("https://scanner.tradingview.com/global/scan",
-                          json={"symbols": {"tickers": ["MCX:CRUDEOILM1!"], "query": {"types": []}},
-                                "columns": ["close", "change", "change_abs", "open", "high", "low"]},
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        d = r.json()["data"][0]["d"]
-        return {"ltp": d[0], "chg": d[2], "pct": d[1], "prev": round(d[0] - d[2], 2),
-                "open": d[3], "high": d[4], "low": d[5], "oi": None, "volume": None, "src": "TradingView"}
-    except Exception:
-        return None
-
+        return {"ltp": last, "chg": chg, "pct": pct, "prev": prev, "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"), "oi": q.get("oi"), "volume": q.get("volume"), "src": "Upstox"}
+    return None
 
 price = get_price()
 
 # ==============================
-# OPTION CHAIN -> OI, change OI, Greeks
-# 1) Upstox option-chain API
-# 2) Fallback (if empty): instrument master + quotes + greeks + previous-day OI
+# OPTION CHAIN
 # ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-
 def _fetch_prev_oi(key, day_iso):
-    """(ok, OI at the last completed daily candle before day_iso)."""
     frm = (dt.date.fromisoformat(day_iso) - dt.timedelta(days=10)).isoformat()
     j = api_get(f"/v2/historical-candle/{quote(key, safe='')}/day/{day_iso}/{frm}", {})
-    if j.get("status") != "success":
-        return False, None
+    if j.get("status") != "success": return False, None
     for c in (j.get("data") or {}).get("candles") or []:
         if str(c[0])[:10] < day_iso and len(c) > 6 and c[6] is not None:
             return True, c[6]
     return True, None
-
 
 def chain_from_option_api():
     j = api_get("/v2/option/chain", {"instrument_key": FUT_KEY, "expiry_date": opt_expiry})
@@ -247,8 +197,7 @@ def chain_from_option_api():
             cg, pg = c.get("option_greeks") or {}, p.get("option_greeks") or {}
             c_oi, p_oi = cm.get("oi") or 0, pm.get("oi") or 0
             rows.append({
-                "strike": it["strike_price"],
-                "call_oi": c_oi, "put_oi": p_oi,
+                "strike": it["strike_price"], "call_oi": c_oi, "put_oi": p_oi,
                 "call_chg": c_oi - (cm.get("prev_oi") or 0), "put_chg": p_oi - (pm.get("prev_oi") or 0),
                 "call_ltp": cm.get("ltp"), "put_ltp": pm.get("ltp"),
                 "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
@@ -258,62 +207,59 @@ def chain_from_option_api():
                 "has_chg": True,
             })
     df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True) if rows else None
-    if df is not None and (df["call_oi"].sum() + df["put_oi"].sum()) == 0:
-        df = None
+    if df is not None and (df["call_oi"].sum() + df["put_oi"].sum()) == 0: df = None
     return df, json.dumps(j)[:500]
 
-
 def chain_from_instruments(spot):
-    opts = [i for i in ins if i["type"] in ("CE", "PE") and i["underlying_key"] == FUT_KEY
-            and i["expiry"] == opt_expiry and i.get("strike") is not None]
-    if not opts:
-        return None, "No CE/PE instruments with strike found for this expiry in the instrument file"
+    opts = [i for i in ins if i["type"] in ("CE", "PE") and i["underlying_key"] == FUT_KEY and i["expiry"] == opt_expiry and i.get("strike") is not None]
+    if not opts: return None, "No CE/PE instruments with strike found"
     by_strike = {}
     for o in opts:
-        by_strike.setdefault(float(o["strike"]), {})[o["type"]] = o["key"]
+        by_strike.setdefault(float(o["strike"]), {})[o["type"]] = {"key": o["key"], "symbol": o["symbol"]}
     strikes = sorted(by_strike)
 
-    # OI + LTP for every strike (bulk quotes)
     quotes = {}
     for ch in _chunks([o["key"] for o in opts], 300):
         j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(ch)})
-        if j.get("status") != "success":
-            return None, "quotes error: " + json.dumps(j)[:400]
+        if j.get("status") != "success": return None, "quotes error: " + json.dumps(j)[:400]
         for v in (j.get("data") or {}).values():
             quotes[v.get("instrument_token")] = v
 
-    # window of strikes around price for Greeks + change in OI
     mid = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot)) if spot else len(strikes) // 2
     win = strikes[max(0, mid - strike_window): mid + strike_window + 1]
     wkeys = [k for s_ in win for k in by_strike[s_].values()]
 
     greeks = {}
-    for ch in _chunks(wkeys, 50):
+    for ch in _chunks([k["key"] for k in wkeys], 50):
         j = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(ch)})
-        if j.get("status") == "success":
-            greeks.update(j.get("data") or {})
+        if j.get("status") == "success": greeks.update(j.get("data") or {})
 
     cache = st.session_state.setdefault("prev_oi", {})
-    todo = [k for k in wkeys if (k, today_iso) not in cache]
+    todo = [k["key"] for k in wkeys if (k["key"], today_iso) not in cache]
     if todo:
         with ThreadPoolExecutor(8) as ex:
             for k, (ok, v) in zip(todo, ex.map(lambda k: _fetch_prev_oi(k, today_iso), todo)):
-                if ok:
-                    cache[(k, today_iso)] = v
+                if ok: cache[(k, today_iso)] = v
 
     rows = []
     for s_ in strikes:
         ck, pk = by_strike[s_].get("CE"), by_strike[s_].get("PE")
-        cq, pq = quotes.get(ck) or {}, quotes.get(pk) or {}
-        cg, pg = greeks.get(ck) or {}, greeks.get(pk) or {}
-        c_oi, p_oi = cq.get("oi") or 0, pq.get("oi") or 0
-        c_prev, p_prev = cache.get((ck, today_iso)), cache.get((pk, today_iso))
+        cq = quotes.get(ck["key"]) if ck else {}
+        pq = quotes.get(pk["key"]) if pk else {}
+        cg = greeks.get(ck["key"]) if ck else {}
+        pg = greeks.get(pk["key"]) if pk else {}
+        
+        c_oi = cq.get("oi") or 0
+        p_oi = pq.get("oi") or 0
+        c_prev = cache.get((ck["key"], today_iso)) if ck else None
+        p_prev = cache.get((pk["key"], today_iso)) if pk else None
         has = (s_ in win) and c_prev is not None and p_prev is not None
+        
         rows.append({
-            "strike": s_,
-            "call_oi": c_oi, "put_oi": p_oi,
+            "strike": s_, "call_oi": c_oi, "put_oi": p_oi,
             "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
             "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
+            "call_symbol": ck["symbol"] if ck else "", "put_symbol": pk["symbol"] if pk else "",
             "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
             "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
             "put_delta": pg.get("delta") or 0, "put_gamma": pg.get("gamma") or 0,
@@ -322,97 +268,27 @@ def chain_from_instruments(spot):
         })
     df = pd.DataFrame(rows).reset_index(drop=True)
     if (df["call_oi"].sum() + df["put_oi"].sum()) == 0:
-        return None, f"Quotes returned zero OI for all {len(opts)} option contracts"
+        return None, "Zero OI"
     return df, None
 
-
 def get_chain():
-    if not opt_expiry:
-        return None, "No option expiry found", "none", ""
+    if not opt_expiry: return None, "No expiry", "none", ""
     df, raw = chain_from_option_api()
-    if df is not None:
-        return df, None, "Upstox option-chain API", raw
+    if df is not None: return df, None, "Upstox option-chain API", raw
     df, err = chain_from_instruments(price["ltp"] if price else 0)
-    return df, err, "Instrument master + quotes + prev-day OI", raw
-
+    return df, err, "Instrument master + quotes", raw
 
 chain, chain_err, chain_src, chain_raw = get_chain()
 
-
 # ==============================
-# CRUDEOILM OI FLOW – macro score (-1 to +1) across active futures contracts
-# Same scoring idea as the Nifty flow: OI value change + price move, weighted by OI value.
-# ==============================
-def compute_crude_flow():
-    keys = [f["key"] for f in futs]
-    j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(keys)})
-    if j.get("status") != "success":
-        return {"score": 0.0, "rows": [], "err": json.dumps(j)[:300]}
-    q = {v.get("instrument_token"): v for v in (j.get("data") or {}).values()}
-
-    cache = st.session_state.setdefault("prev_oi", {})
-    for k in keys:
-        if (k, today_iso) not in cache:
-            ok, v = _fetch_prev_oi(k, today_iso)
-            if ok:
-                cache[(k, today_iso)] = v
-
-    big = flow_big_cr * 1e7          # crore -> rupees
-    rows, wsum, wtot = [], 0.0, 0.0
-    for f in futs:
-        v = q.get(f["key"]) or {}
-        last, chg, oi = v.get("last_price") or 0, v.get("net_change") or 0, v.get("oi") or 0
-        prev_oi = cache.get((f["key"], today_iso))
-        if not last or prev_oi is None:
-            continue
-        lot = float(f.get("lot_size") or 10)
-        prev_px = last - chg
-        price_pct = chg / prev_px * 100 if prev_px else 0
-        cur_val = oi * lot * last
-        chg_abs = (oi - prev_oi) * lot * last
-        oi_pct = (oi - prev_oi) / prev_oi * 100 if prev_oi else 0
-        if cur_val < 100_000_000:    # ignore tiny contracts
-            continue
-
-        score = 0.0
-        if chg_abs > big and price_pct < -0.3:
-            score = -0.9
-        elif chg_abs > big and price_pct > 0.3:
-            score = 0.9
-        elif oi_pct > flow_pct * 3 and price_pct < -0.3:
-            score = -0.6
-        elif oi_pct > flow_pct and price_pct < -0.5:
-            score = -0.4
-        elif oi_pct > flow_pct and price_pct > 0.5:
-            score = 0.4
-
-        if oi_pct >= 0:
-            label = "Long Buildup" if price_pct >= 0 else "Short Buildup"
-        else:
-            label = "Short Covering" if price_pct >= 0 else "Long Unwinding"
-
-        weight = cur_val / 1e9
-        wsum += score * weight
-        wtot += weight
-        rows.append({"contract": f["symbol"], "price": last, "price_chg_%": round(price_pct, 2),
-                     "oi": oi, "prev_oi": prev_oi, "oi_chg_%": round(oi_pct, 2),
-                     "oi_value": cur_val, "oi_value_chg": chg_abs,
-                     "view": label, "score": score, "weight": round(weight, 3)})
-    final = max(-1, min(1, wsum / wtot)) if wtot else 0.0
-    return {"score": final, "rows": rows, "err": None}
-
-# ==============================
-# ANALYTICS
+# ANALYTICS & SIGNALS
 # ==============================
 def max_pain(df):
     best, low = None, float("inf")
     for s in df["strike"]:
-        pain = ((s - df["strike"]).clip(lower=0) * df["call_oi"]).sum() + \
-               ((df["strike"] - s).clip(lower=0) * df["put_oi"]).sum()
-        if pain < low:
-            best, low = s, pain
+        pain = ((s - df["strike"]).clip(lower=0) * df["call_oi"]).sum() + ((df["strike"] - s).clip(lower=0) * df["put_oi"]).sum()
+        if pain < low: best, low = s, pain
     return best
-
 
 def oi_signal(df, spot):
     tc, tp = df["call_oi"].sum(), df["put_oi"].sum()
@@ -425,101 +301,106 @@ def oi_signal(df, spot):
     bull = bear = 0
     if spot > mp: bear += 1
     elif spot < mp: bull += 1
-    if pcr > 1.3: bull += 1          # put-heavy = support
+    if pcr > 1.3: bull += 1
     elif pcr < 0.7: bear += 1
     if spot > res: bull += 1
     elif spot < sup: bear += 1
     if net_p > net_c: bull += 1
     elif net_c > net_p: bear += 1
     direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "NEUTRAL"
-    return dict(pcr=pcr, max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p,
-                bull=bull, bear=bear, direction=direction)
+    return dict(pcr=pcr, max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, bull=bull, bear=bear, direction=direction)
 
-
-def greeks_for(row, high_type):
-    side = "put" if high_type == "HIGH PUT" else "call"
-    return {k: row[f"{side}_{k}"] for k in ("delta", "gamma", "theta", "vega", "iv")}
-
-
-def entry_exit(df, spot, buffer, gap, lo, hi, max_candidates=5):
+def get_trade_setup(df, spot, buffer, lo, hi):
     d = df[df["has_chg"]].copy()
-    if d.empty:
-        return None, None
+    if d.empty: return None
+    
+    # Find the strike with the maximum OI change
     d["diff"] = (d["put_chg"] - d["call_chg"]).abs()
-    d["type"] = d.apply(lambda r: "HIGH PUT" if r["put_chg"] > r["call_chg"] else "HIGH CALL", axis=1)
-    d = d[d["diff"] > 0].sort_values("diff", ascending=False)
-    if d.empty:
-        return None, None
-
-    def mk(row, kind):
-        strike = row["strike"]
-        if row["type"] == "HIGH PUT":
-            trig, sig = strike + buffer, "BUY"
-            active = spot >= trig
-            why = f"Support at {strike:g} (Put ΔOI > Call ΔOI). Trigger {trig:g}"
-        else:
-            trig, sig = strike - buffer, "SELL"
-            active = spot <= trig
-            why = f"Resistance at {strike:g} (Call ΔOI > Put ΔOI). Trigger {trig:g}"
-        g = greeks_for(row, row["type"])
-        return dict(strike=strike, type=row["type"], signal=sig, trigger=trig, active=active,
-                    reason=why, diff=row["diff"], greeks=g,
-                    delta_ok=(g["delta"] == 0) or (lo <= abs(g["delta"]) <= hi))
-
-    cands = d.head(max_candidates)
-    pick = None
-    for _, r in cands.iterrows():
-        e = mk(r, "entry")
-        if e["delta_ok"]:
-            pick = e
-            break
-        if pick is None:
-            pick = e          # fallback: top OI-diff strike
-    entry = pick
-
-    opp = "HIGH CALL" if entry["signal"] == "BUY" else "HIGH PUT"
-    o = d[d["type"] == opp]
-    exit_ = None
-    if not o.empty:
-        ex = mk(o.iloc[0], "exit")
-        if abs(ex["trigger"] - entry["trigger"]) >= gap:
-            exit_ = ex
-    if exit_ is None:
-        return None, None
-    return entry, exit_
-
-
-def signal_box(title, s, spot, label):
-    emoji = "🟢" if s["signal"] == "BUY" else "🔴"
-    if s["active"]:
-        bg, fg = ("#2e7d32", "white") if s["signal"] == "BUY" else ("#c62828", "white")
+    d = d.sort_values("diff", ascending=False)
+    if d.empty: return None
+    
+    top_row = d.iloc[0]
+    
+    # Determine Direction
+    # If Put Change > Call Change -> Bullish -> Buy CE
+    # If Call Change > Put Change -> Bearish -> Buy PE
+    is_bullish = top_row["put_chg"] > top_row["call_chg"]
+    
+    # Find target strike for SL/Target calculation
+    if is_bullish:
+        # Support is at top_row['strike']
+        trigger_spot = top_row["strike"] + buffer
+        sl_spot = top_row["strike"] - buffer
+        # Target is the highest Call OI strike (Resistance)
+        target_strike = df.loc[df["call_oi"].idxmax(), "strike"]
+        if target_strike <= trigger_spot: target_strike = trigger_spot + 50 # Fallback
+        opt_type = "CE"
+        opt_delta_col = "call_delta"
+        opt_symbol_col = "call_symbol"
+        opt_ltp_col = "call_ltp"
+        opt_iv_col = "call_iv"
+        reason = f"Bullish OI Flow. Put buildup at {top_row['strike']:g}."
     else:
-        bg, fg = "#f9a825", "black"
-    status = "ACTIVE" if s["active"] else "PENDING (waiting for trigger)"
-    g = s["greeks"]
-    flt = "✅ passes delta filter" if s["delta_ok"] else "⚠️ outside delta band"
-    st.markdown(f"""
-    <div class="entry" style="background:{bg};color:{fg};border-left-color:{'#2e7d32' if s['signal']=='BUY' else '#c62828'}">
-      <span style="font-size:1.5rem;font-weight:800">{emoji} {label} {s['signal']} @ {s['trigger']:,.2f}</span>
-      <span class="pill" style="margin-left:10px">{s['type']}</span>
-      <span class="pill">{status}</span><br>
-      <span style="font-size:.9rem">Spot {spot:,.2f} | Key strike {s['strike']:g} | ΔOI diff {s['diff']:,.0f}<br>
-      📌 {s['reason']}<br>
-      Δ {g['delta']:.3f} · Γ {g['gamma']:.5f} · Θ {g['theta']:.2f} · V {g['vega']:.2f} · IV {g['iv']:.1f}% — {flt}</span>
-    </div>""", unsafe_allow_html=True)
+        # Resistance is at top_row['strike']
+        trigger_spot = top_row["strike"] - buffer
+        sl_spot = top_row["strike"] + buffer
+        # Target is the highest Put OI strike (Support)
+        target_strike = df.loc[df["put_oi"].idxmax(), "strike"]
+        if target_strike >= trigger_spot: target_strike = trigger_spot - 50 # Fallback
+        opt_type = "PE"
+        opt_delta_col = "put_delta"
+        opt_symbol_col = "put_symbol"
+        opt_ltp_col = "put_ltp"
+        opt_iv_col = "put_iv"
+        reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
 
+    # Find the best option strike based on Delta and ATM proximity
+    # We look for an option where abs(delta) is within the band [lo, hi], closest to spot
+    best_opt = None
+    min_dist = float("inf")
+    
+    for _, row in df.iterrows():
+        delta = abs(row[opt_delta_col])
+        # Filter by delta band
+        if lo <= delta <= hi:
+            dist = abs(row["strike"] - spot)
+            if dist < min_dist:
+                min_dist = dist
+                best_opt = row
+
+    # Fallback if no option matches the delta band, just pick ATM
+    if best_opt is None:
+        best_opt = df.iloc[(df["strike"] - spot).abs().argsort()[:1]].iloc[0]
+        
+    opt_premium = best_opt[opt_ltp_col]
+    opt_symbol = best_opt[opt_symbol_col]
+    opt_delta = best_opt[opt_delta_col]
+    opt_iv = best_opt[opt_iv_col]
+    
+    # Calculate Risk Reward on Spot
+    risk = abs(trigger_spot - sl_spot)
+    reward = abs(target_strike - trigger_spot)
+    rr = round(reward / risk, 2) if risk > 0 else 0
+
+    return {
+        "type": opt_type,
+        "symbol": opt_symbol,
+        "strike": best_opt["strike"],
+        "premium": opt_premium,
+        "delta": opt_delta,
+        "iv": opt_iv,
+        "entry_spot": trigger_spot,
+        "sl_spot": sl_spot,
+        "target_spot": target_strike,
+        "rr": rr,
+        "reason": reason,
+        "is_bullish": is_bullish
+    }
 
 # ==============================
-# UI
+# UI LAYOUT
 # ==============================
-st.title("🛢️ CRUDEOILM Analytics — MCX")
-lot = fut.get("lot_size")
-st.markdown(
-    f'<span class="pill">Futures: {fut["symbol"]}</span>'
-    f'<span class="pill">Fut expiry: {fut["expiry"]}</span>'
-    f'<span class="pill">Option expiry: {opt_expiry or "—"}</span>'
-    f'<span class="pill">Lot: {lot if lot else "—"}</span>',
-    unsafe_allow_html=True)
+st.title("🛢️ CRUDEOILM Analytics & Options Setup")
 
 if not price:
     st.error("Could not fetch CRUDEOILM price.")
@@ -529,99 +410,114 @@ spot = price["ltp"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
 
-c1, c2, c3, c4 = st.columns(4)
+# Top Row: Price & Signal
+c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
 with c1:
     st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut) · {price['src']}</div>
       <div class="big">{spot:,.2f}</div>
       <div class="{cls}">{arrow} {price['chg']:+,.2f} ({price['pct']:+.2f}%)</div>
       <div style="font-size:.8rem;color:#888">Prev: {price['prev']:,.2f}</div></div>""", unsafe_allow_html=True)
 with c2:
-    st.markdown(f"""<div class="card"><div style="color:#666">Day range</div>
-      <div style="font-size:1.1rem">O {price['open'] or 0:,.2f}<br>H {price['high'] or 0:,.2f}<br>L {price['low'] or 0:,.2f}</div></div>""",
-                unsafe_allow_html=True)
+    st.markdown(f"""<div class="card"><div style="color:#666">Day High</div><div style="font-size:1.2rem;font-weight:bold">{price['high'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
 with c3:
-    st.markdown(f"""<div class="card"><div style="color:#666">Futures OI / Volume</div>
-      <div style="font-size:1.1rem">OI {price['oi'] if price['oi'] is not None else '—'}<br>
-      Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
+with c4:
+    if chain is not None and not chain.empty:
+        sig = oi_signal(chain, spot)
+        kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
+        st.markdown(f"""<div class="pred {kls}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Macro OI Signal</div>
+          <div style="font-size:1.4rem;font-weight:800">{sig['direction']}</div>
+          <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
+    else:
+        st.warning("No Chain Data")
+
+st.markdown("---")
+
+# ==============================
+# TRADE SETUP (CALL/PUT)
+# ==============================
+st.subheader("🎯 Actionable Options Trade Setup")
 
 if chain is None or chain.empty:
-    st.error("Could not build the CRUDEOILM option chain.")
-    with st.expander("Debug details (send me this if it still fails)", expanded=True):
-        st.write("Futures key:", FUT_KEY, "| Option expiry:", opt_expiry)
-        st.write("Option-chain API raw response:")
-        st.code(chain_raw or "—")
-        st.write("Fallback result:")
-        st.code(chain_err or "—")
-    st.stop()
-
-st.caption(f"OI source: {chain_src} · expiry {opt_expiry}")
-if not chain["has_chg"].any():
-    st.warning("Change-in-OI is unavailable (previous-day OI not returned), so entry/exit signals are off.")
-sig = oi_signal(chain, spot)
-with c4:
-    kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
-    st.markdown(f"""<div class="pred {kls}"><div style="opacity:.8">OI Signal</div>
-      <div style="font-size:1.6rem;font-weight:800">{sig['direction']}</div>
-      <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("PCR", f"{sig['pcr']:.2f}")
-m2.metric("Max Pain", f"{sig['max_pain']:,.0f}")
-m3.metric("Support (max Put OI)", f"{sig['support']:,.0f}")
-m4.metric("Resistance (max Call OI)", f"{sig['resistance']:,.0f}")
-m5.metric("Net ΔOI  Calls / Puts", f"{sig['net_c']:+,.0f} / {sig['net_p']:+,.0f}")
-
-# ---- Entry / Exit ----
-st.subheader("📊 OI Change Entry Signal")
-entry, exit_ = entry_exit(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi)
-if entry:
-    signal_box("Entry", entry, spot, "ENTRY")
-    st.subheader("📊 OI Change Exit Signal")
-    signal_box("Exit", exit_, spot, "EXIT")
+    st.error("Could not build option chain. Cannot generate trade setup.")
 else:
-    st.info("ℹ️ No entry/exit signal (no OI change, or entry–exit gap below the minimum).")
+    setup = get_trade_setup(chain, spot, buffer_pts, delta_lo, delta_hi)
+    
+    if setup:
+        bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
+        border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
+        
+        # Build Trade Card HTML
+        st.markdown(f"""
+        <div class="trade-card" style="background:{bg}; border-left-color:{border};">
+            <div class="trade-header">🟢 BUY {setup['symbol']} @ {setup['premium']:.2f}</div>
+            <div><b>Strategy:</b> {setup['reason']}</div>
+            
+            <div class="trade-grid">
+                <div class="trade-item">
+                    <div class="trade-label">Entry Trigger (Spot)</div>
+                    <div class="trade-value">{setup['entry_spot']:,.2f}</div>
+                </div>
+                <div class="trade-item">
+                    <div class="trade-label">Stop Loss (Spot)</div>
+                    <div class="trade-value">{setup['sl_spot']:,.2f}</div>
+                </div>
+                <div class="trade-item">
+                    <div class="trade-label">Target (Spot)</div>
+                    <div class="trade-value">{setup['target_spot']:,.2f}</div>
+                </div>
+                <div class="trade-item">
+                    <div class="trade-label">Risk / Reward</div>
+                    <div class="trade-value">1 : {setup['rr']}</div>
+                </div>
+            </div>
+            
+            <div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;">
+                <div>📊 <b>Delta:</b> {setup['delta']:.3f}</div>
+                <div>📈 <b>IV:</b> {setup['iv']:.1f}%</div>
+                <div>💰 <b>Lot Size:</b> {fut.get('lot_size', '—')}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if spot >= setup["entry_spot"] if setup["is_bullish"] else spot <= setup["entry_spot"]:
+            st.success("🔥 **ENTRY ACTIVE:** Spot price has hit the trigger! You can enter this trade now.")
+        else:
+            st.info("⏳ **PENDING:** Waiting for Spot price to hit the Entry Trigger.")
+            
+    else:
+        st.info("ℹ️ No high-confidence OI change detected for a Call/Put setup right now.")
 
-# ---- OI chart ----
-st.subheader("Open Interest by Strike")
-st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
-st.subheader("Change in OI by Strike")
-st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
+st.markdown("---")
 
-# ---- Tables ----
-def hl_top5(row):
-    return (["background-color:#ffd700;font-weight:bold;color:#000"] * len(row)) if row.name < 5 else [""] * len(row)
+# ==============================
+# TABLES & CHARTS
+# ==============================
+if chain is not None and not chain.empty:
+    st.subheader("Open Interest by Strike")
+    st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
+    
+    st.subheader("Change in OI by Strike")
+    st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
 
-oi_tbl = chain[["strike", "call_oi", "put_oi"]].copy()
-oi_tbl["HIGH OI"] = oi_tbl.apply(lambda r: "HIGH PUT" if r.put_oi > r.call_oi else "HIGH CALL", axis=1)
-oi_tbl["OI Difference"] = (oi_tbl["put_oi"] - oi_tbl["call_oi"]).abs()
-st.subheader("Open Interest Data (top by difference)")
-st.dataframe(oi_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True)
-             .style.apply(hl_top5, axis=1))
+    def hl_top5(row):
+        return (["background-color:#ffd700;font-weight:bold;color:#000"] * len(row)) if row.name < 5 else [""] * len(row)
 
-chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg"]].copy()
-chg_tbl["HIGH OI"] = chg_tbl.apply(lambda r: "HIGH PUT" if r.put_chg > r.call_chg else "HIGH CALL", axis=1)
-chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
-st.subheader("Change in OI (top by difference)")
-st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True)
-             .style.apply(hl_top5, axis=1))
+    col1, col2 = st.columns(2)
+    with col1:
+        oi_tbl = chain[["strike", "call_oi", "put_oi"]].copy()
+        oi_tbl["OI Difference"] = (oi_tbl["put_oi"] - oi_tbl["call_oi"]).abs()
+        st.subheader("Top OI Difference")
+        st.dataframe(oi_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1))
+    
+    with col2:
+        chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg"]].copy()
+        chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
+        st.subheader("Top Change in OI")
+        st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1))
 
-# ---- OI Flow / Macro score ----
-flow = compute_crude_flow()
-if flow["rows"]:
-    st.subheader(f"CRUDEOILM OI Flow Details — Macro Score: {flow['score']:.2f}")
-    st.markdown("**Weighted Macro Score (-1 to +1)**: Based on OI value change and price change across active CRUDEOILM futures.")
-    bias = "Bullish" if flow["score"] > 0 else ("Bearish" if flow["score"] < 0 else "Sideways")
-    st.write(f"Market Bias: {bias}")
-    st.dataframe(pd.DataFrame(flow["rows"]))
-else:
-    st.info("OI flow not available (no futures contract met the OI-value threshold, or previous-day OI was not returned).")
-    if flow.get("err"):
-        st.code(flow["err"])
+    st.subheader("Option Chain + Greeks (Nearest to Spot)")
+    near = chain.iloc[(chain["strike"] - spot).abs().argsort()[:15]].sort_values("strike")
+    st.dataframe(near[["strike", "call_ltp", "call_oi", "call_delta", "call_iv", "put_ltp", "put_oi", "put_delta", "put_iv"]].reset_index(drop=True))
 
-# ---- Option chain with Greeks around spot ----
-st.subheader("Option Chain + Greeks (strikes nearest to price)")
-near = chain.iloc[(chain["strike"] - spot).abs().argsort()[:15]].sort_values("strike")
-st.dataframe(near[["strike", "call_ltp", "call_oi", "call_delta", "call_gamma", "call_theta", "call_iv",
-                   "put_ltp", "put_oi", "put_delta", "put_gamma", "put_theta", "put_iv"]].reset_index(drop=True))
-
-st.caption(f"Last refresh: {now.strftime('%Y-%m-%d %H:%M:%S IST')} · auto-refresh every 15s")
+st.caption(f"Last refresh: {now.strftime('%H:%M:%S IST')} · auto-refresh every 15s")
