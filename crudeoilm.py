@@ -58,7 +58,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================
-# SIDEBAR
+# SIDEBAR (settings only)
 # ==============================
 with st.sidebar:
     st.title("🛢️ CRUDEOILM Settings")
@@ -133,17 +133,53 @@ if not futs:
     st.error("No active CRUDEOILM futures found in the instrument file.")
     st.stop()
 
+# =========================================================
+# SIDEBAR: AUTO-SELECT nearest active Futures + Option expiry
+# =========================================================
 with st.sidebar:
     st.markdown("---")
-    fut_labels = {f"{f['symbol']}  (exp {f['expiry']})": f for f in futs}
-    fut = fut_labels[st.selectbox("Futures contract (price)", list(fut_labels.keys()), index=0)]
 
-    opt_expiries = sorted({i["expiry"] for i in ins
-                           if i["type"] in ("CE", "PE")
-                           and i["underlying_key"] == fut["key"]
-                           and i["expiry"] >= today_iso})
+    # ---- Futures contract ----
+    # `futs` is already sorted by expiry ascending and filtered to >= today,
+    # so futs[0] is the nearest active contract. We default to it, but
+    # respect a manual override that is still valid.
+    fut_labels = {f"{f['symbol']} (exp {f['expiry']})": f for f in futs}
+    fut_label_list = list(fut_labels.keys())
+
+    # Drop stale override (e.g. the chosen contract expired)
+    if "fut_selector" in st.session_state and st.session_state.fut_selector not in fut_labels:
+        del st.session_state.fut_selector
+
+    sel_fut_label = st.selectbox(
+        "Futures contract (price)",
+        fut_label_list,
+        index=0,                                   # nearest active by default
+        key="fut_selector",                        # persists manual override across refreshes
+        help="Auto-selects the nearest active contract. Override manually if needed.",
+    )
+    fut = fut_labels[sel_fut_label]
+
+    # ---- Option expiry for the chosen futures ----
+    opt_expiries = sorted({
+        i["expiry"] for i in ins
+        if i["type"] in ("CE", "PE")
+        and i["underlying_key"] == fut["key"]
+        and i["expiry"] >= today_iso
+    })
+
     if opt_expiries:
-        opt_expiry = st.selectbox("Option expiry (OI / Greeks)", opt_expiries, index=0)
+        # If the futures contract changed, the old expiry may not exist any more.
+        if "opt_expiry_selector" in st.session_state and \
+           st.session_state.opt_expiry_selector not in opt_expiries:
+            del st.session_state.opt_expiry_selector
+
+        opt_expiry = st.selectbox(
+            "Option expiry (OI / Greeks)",
+            opt_expiries,
+            index=0,                               # nearest active by default
+            key="opt_expiry_selector",
+            help="Auto-selects the nearest active expiry. Override manually if needed.",
+        )
     else:
         opt_expiry = None
         st.warning("No option expiries found for this futures contract.")
