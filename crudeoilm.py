@@ -4,6 +4,7 @@ from urllib.parse import quote
 import json
 import os
 import datetime as dt
+import math
 
 import pandas as pd
 import pytz
@@ -56,6 +57,7 @@ st.markdown("""
 .trade-item{text-align:center;}
 .trade-label{font-size:0.8rem; opacity:0.8; text-transform:uppercase; letter-spacing:1px;}
 .trade-value{font-size:1.3rem; font-weight:bold;}
+.warn-badge{background: #f9a825; color: #000; padding: 4px 10px; border-radius: 5px; font-weight: bold; font-size: 0.9rem;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -68,12 +70,16 @@ with st.sidebar:
     if not get_token():
         st.text_input("Upstox token (Bearer ...)", type="password", key="tok_input")
     
-    st.markdown("**Risk Management**")
+    st.markdown("**💰 Position Sizing**")
+    capital = st.number_input("Account Capital (₹)", min_value=10000, value=100000, step=10000)
+    risk_pct = st.number_input("Risk per trade (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+    
+    st.markdown("**🎯 Risk Management**")
     buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1, help="Distance from the OI wall to trigger entry")
     min_gap = st.number_input("Min entry–exit gap (points)", 5, 500, 30, 5)
     delta_lo, delta_hi = st.slider("Option Delta Band", 0.05, 0.95, (0.30, 0.75), 0.05, help="Select ATM/OTM strikes based on Delta")
     
-    st.markdown("**Analytics**")
+    st.markdown("**📊 Analytics**")
     top_n = st.slider("Rows in OI tables", 5, 40, 20, 5)
     strike_window = st.slider("Strikes each side of price (for Greeks)", 5, 40, 20, 5)
     flow_big_cr = st.number_input("Big OI value change (₹ crore)", 1.0, 500.0, 10.0, 1.0)
@@ -153,10 +159,24 @@ with st.sidebar:
         st.warning("No option expiries found.")
 
 FUT_KEY = fut["key"]
+LOT_SIZE = fut.get("lot_size", 10)
 
 # ==============================
-# PRICE
+# PRICE & TREND (20 EMA)
 # ==============================
+@st.cache_data(ttl=300)
+def get_trend_ema(fut_key):
+    j = api_get(f"/v2/historical-candle/intraday/{quote(fut_key, safe='')}/5minute", {})
+    if j.get("status") == "success":
+        candles = j.get("data", {}).get("candles", [])
+        if len(candles) >= 20:
+            # Candles are newest first, reverse to chronological
+            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+            df = df.iloc[::-1]
+            df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+            return df["ema_20"].iloc[-1]
+    return None
+
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
     if j.get("status") == "success" and j.get("data"):
@@ -170,9 +190,10 @@ def get_price():
     return None
 
 price = get_price()
+ema_20 = get_trend_ema(FUT_KEY)
 
 # ==============================
-# OPTION CHAIN (With Volume Added)
+# OPTION CHAIN
 # ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -200,7 +221,7 @@ def chain_from_option_api():
                 "strike": it["strike_price"], "call_oi": c_oi, "put_oi": p_oi,
                 "call_chg": c_oi - (cm.get("prev_oi") or 0), "put_chg": p_oi - (pm.get("prev_oi") or 0),
                 "call_ltp": cm.get("ltp"), "put_ltp": pm.get("ltp"),
-                "call_vol": cm.get("volume") or 0, "put_vol": pm.get("volume") or 0, # <--- NEW VOLUME
+                "call_vol": cm.get("volume") or 0, "put_vol": pm.get("volume") or 0,
                 "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
                 "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
                 "put_delta": pg.get("delta") or 0, "put_gamma": pg.get("gamma") or 0,
@@ -245,7 +266,6 @@ def chain_from_instruments(spot):
     rows = []
     for s_ in strikes:
         ck, pk = by_strike[s_].get("CE"), by_strike[s_].get("PE")
-        
         cq = (quotes.get(ck["key"]) if ck else None) or {}
         pq = (quotes.get(pk["key"]) if pk else None) or {}
         cg = (greeks.get(ck["key"]) if ck else None) or {}
@@ -261,7 +281,7 @@ def chain_from_instruments(spot):
             "strike": s_, "call_oi": c_oi, "put_oi": p_oi,
             "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
             "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
-            "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0, # <--- NEW VOLUME
+            "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0,
             "call_symbol": ck["symbol"] if ck else "", "put_symbol": pk["symbol"] if pk else "",
             "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
             "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
@@ -291,7 +311,7 @@ def get_chain():
 chain, chain_err, chain_src, chain_raw = get_chain()
 
 # ==============================
-# RESTORED: FUTURES OI FLOW LOGIC
+# FUTURES OI FLOW
 # ==============================
 def compute_crude_flow():
     keys = [f["key"] for f in futs]
@@ -357,8 +377,6 @@ def max_pain(df):
 def oi_signal(df, spot):
     tc, tp = df["call_oi"].sum(), df["put_oi"].sum()
     pcr = tp / tc if tc else 1.0
-    
-    # New Volume Calculations
     total_cv = df["call_vol"].sum()
     total_pv = df["put_vol"].sum()
     vol_pcr = total_pv / total_cv if total_cv else 1.0
@@ -383,7 +401,7 @@ def oi_signal(df, spot):
                 max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, 
                 bull=bull, bear=bear, direction=direction)
 
-def get_trade_setup(df, spot, buffer, lo, hi):
+def get_trade_setup(df, spot, buffer, lo, hi, capital, risk_pct, trend_ema):
     d = df[df["has_chg"]].copy()
     if d.empty: return None
     
@@ -413,6 +431,12 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         opt_vol_col = "put_vol"
         reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
 
+    # TREND FILTER
+    counter_trend = False
+    if trend_ema:
+        if is_bullish and spot < trend_ema: counter_trend = True
+        if not is_bullish and spot > trend_ema: counter_trend = True
+
     best_opt = None
     min_dist = float("inf")
     
@@ -429,11 +453,30 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         
     opt_premium = best_opt[opt_ltp_col] if not pd.isna(best_opt[opt_ltp_col]) else 0.0
     opt_delta = best_opt[opt_delta_col] if not pd.isna(best_opt[opt_delta_col]) else 0.0
+    if opt_delta == 0: opt_delta = 0.5 # Fallback if Greeks missing
+    
     opt_iv = best_opt[opt_iv_col] if not pd.isna(best_opt[opt_iv_col]) else 0.0
     opt_symbol = best_opt[opt_symbol_col] if best_opt[opt_symbol_col] else "Unknown"
-    
-    # Volume Analysis for specific option
     opt_vol = best_opt[opt_vol_col]
+    
+    # PREMIUM STOP LOSS CALCULATION
+    spot_risk = abs(trigger_spot - sl_spot)
+    premium_risk = spot_risk * opt_delta
+    premium_sl = max(1.0, opt_premium - premium_risk)
+    
+    # TARGET CALCULATION (Premium)
+    spot_reward = abs(target_strike - trigger_spot)
+    premium_target = opt_premium + (spot_reward * opt_delta)
+
+    # POSITION SIZING
+    risk_amount = capital * (risk_pct / 100)
+    risk_per_lot = (opt_premium - premium_sl) * LOT_SIZE
+    if risk_per_lot > 0:
+        lots = math.floor(risk_amount / risk_per_lot)
+        if lots < 1 and risk_amount >= risk_per_lot: lots = 1
+    else:
+        lots = 0
+
     avg_vol = df[opt_vol_col].mean()
     vol_confirm = "🔥 HIGH VOL" if opt_vol > avg_vol * 1.5 else "Normal"
     
@@ -445,8 +488,11 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         "type": opt_type, "symbol": opt_symbol, "strike": best_opt["strike"],
         "premium": opt_premium, "delta": opt_delta, "iv": opt_iv,
         "opt_vol": opt_vol, "vol_confirm": vol_confirm,
+        "premium_sl": premium_sl, "premium_target": premium_target,
+        "lots": lots,
         "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_strike,
-        "rr": rr, "reason": reason, "is_bullish": is_bullish
+        "rr": rr, "reason": reason, "is_bullish": is_bullish,
+        "counter_trend": counter_trend
     }
 
 # ==============================
@@ -462,8 +508,8 @@ spot = price["ltp"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
 
-# Top Row: Price
-c1, c2, c3 = st.columns([2, 1, 1])
+# Top Row: Price & Trend
+c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
 with c1:
     st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut) · {price['src']}</div>
       <div class="big">{spot:,.2f}</div>
@@ -473,6 +519,15 @@ with c2:
     st.markdown(f"""<div class="card"><div style="color:#666">Day High</div><div style="font-size:1.2rem;font-weight:bold">{price['high'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
 with c3:
     st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
+with c4:
+    if ema_20:
+        t_color = "bullish" if spot > ema_20 else "bearish"
+        t_text = "BULLISH (Above EMA)" if spot > ema_20 else "BEARISH (Below EMA)"
+        st.markdown(f"""<div class="pred {t_color}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Trend Filter (20 EMA)</div>
+          <div style="font-size:1.2rem;font-weight:800">{t_text}</div>
+          <div style="font-size:.85rem">EMA: {ema_20:,.2f}</div></div>""", unsafe_allow_html=True)
+    else:
+        st.info("Trend EMA Data Unavailable")
 
 st.markdown("---")
 
@@ -484,13 +539,35 @@ st.subheader("🎯 Actionable Options Trade Setup")
 if chain is None or chain.empty:
     st.error("Could not build option chain. Cannot generate trade setup.")
 else:
-    setup = get_trade_setup(chain, spot, buffer_pts, delta_lo, delta_hi)
+    setup = get_trade_setup(chain, spot, buffer_pts, delta_lo, delta_hi, capital, risk_pct, ema_20)
     
     if setup:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
         border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
         
-        card_html = f'<div class="trade-card" style="background:{bg}; border-left-color:{border};"><div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div><div><b>Strategy:</b> {setup["reason"]}</div><div class="trade-grid"><div class="trade-item"><div class="trade-label">Entry Trigger (Spot)</div><div class="trade-value">{setup["entry_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Stop Loss (Spot)</div><div class="trade-value">{setup["sl_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Target (Spot)</div><div class="trade-value">{setup["target_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Risk / Reward</div><div class="trade-value">1 : {setup["rr"]}</div></div></div><div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;"><div>📊 <b>Delta:</b> {setup["delta"]:.3f}</div><div>📈 <b>IV:</b> {setup["iv"]:.1f}%</div><div>📦 <b>Strike Vol:</b> {setup["opt_vol"]:,} ({setup["vol_confirm"]})</div><div>💰 <b>Lot Size:</b> {fut.get("lot_size", "—")}</div></div></div>'
+        warning_html = ""
+        if setup["counter_trend"]:
+            warning_html = '<div style="margin-top:10px;"><span class="warn-badge">⚠️ WARNING: This trade is against the 20 EMA Trend. Trade with caution.</span></div>'
+        
+        card_html = f'''<div class="trade-card" style="background:{bg}; border-left-color:{border};">
+<div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div>
+<div><b>Strategy:</b> {setup["reason"]}</div>
+{warning_html}
+<div class="trade-grid">
+<div class="trade-item"><div class="trade-label">Entry Premium</div><div class="trade-value">₹ {setup["premium"]:.2f}</div></div>
+<div class="trade-item"><div class="trade-label">Premium SL</div><div class="trade-value">₹ {setup["premium_sl"]:.2f}</div></div>
+<div class="trade-item"><div class="trade-label">Premium Target</div><div class="trade-value">₹ {setup["premium_target"]:.2f}</div></div>
+<div class="trade-item"><div class="trade-label">Position Size</div><div class="trade-value">{setup["lots"]} Lots</div></div>
+</div>
+<div style="margin-top:15px; font-size:0.9rem; display:flex; flex-wrap:wrap; gap:20px; opacity:0.9;">
+<div>📊 <b>Spot Entry:</b> {setup["entry_spot"]:,.2f}</div>
+<div>🛑 <b>Spot SL:</b> {setup["sl_spot"]:,.2f}</div>
+<div>🎯 <b>Spot Target:</b> {setup["target_spot"]:,.2f}</div>
+<div>⚖️ <b>Risk/Reward:</b> 1 : {setup["rr"]}</div>
+<div>📈 <b>IV:</b> {setup["iv"]:.1f}%</div>
+<div>📦 <b>Vol:</b> {setup["opt_vol"]:,} ({setup["vol_confirm"]})</div>
+</div>
+</div>'''
         
         st.markdown(card_html, unsafe_allow_html=True)
         
@@ -505,7 +582,7 @@ else:
 st.markdown("---")
 
 # ==============================
-# RESTORED: FUTURES OI FLOW UI
+# FUTURES OI FLOW UI
 # ==============================
 flow = compute_crude_flow()
 if flow["rows"]:
@@ -522,7 +599,6 @@ st.markdown("---")
 # CHARTS & TABLES
 # ==============================
 if chain is not None and not chain.empty:
-    # Signal Box & Volume Metrics
     sig = oi_signal(chain, spot)
     kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
     
@@ -535,16 +611,16 @@ if chain is not None and not chain.empty:
     with col_b:
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("OI PCR", f"{sig['pcr']:.2f}")
-        m2.metric("Vol PCR", f"{sig['vol_pcr']:.2f}", help="Put Volume / Call Volume")
+        m2.metric("Vol PCR", f"{sig['vol_pcr']:.2f}")
         m3.metric("Max Pain", f"{sig['max_pain']:,.0f}")
         m4.metric("Support (Put OI)", f"{sig['support']:,.0f}")
         m5.metric("Resistance (Call OI)", f"{sig['resistance']:,.0f}")
-        m6.metric("Total Call/Put Vol", f"{sig['total_cv']:,} / {sig['total_pv']:,}")
+        m6.metric("Total C/P Vol", f"{sig['total_cv']:,} / {sig['total_pv']:,}")
 
     st.subheader("Open Interest by Strike")
     st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
     
-    st.subheader("Trading Volume by Strike (Call vs Put)")
+    st.subheader("Trading Volume by Strike")
     st.bar_chart(chain.set_index("strike")[["call_vol", "put_vol"]])
     
     st.subheader("Change in OI by Strike")
