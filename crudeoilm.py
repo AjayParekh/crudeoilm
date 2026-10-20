@@ -172,7 +172,7 @@ def get_price():
 price = get_price()
 
 # ==============================
-# OPTION CHAIN
+# OPTION CHAIN (With Volume Added)
 # ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -200,6 +200,7 @@ def chain_from_option_api():
                 "strike": it["strike_price"], "call_oi": c_oi, "put_oi": p_oi,
                 "call_chg": c_oi - (cm.get("prev_oi") or 0), "put_chg": p_oi - (pm.get("prev_oi") or 0),
                 "call_ltp": cm.get("ltp"), "put_ltp": pm.get("ltp"),
+                "call_vol": cm.get("volume") or 0, "put_vol": pm.get("volume") or 0, # <--- NEW VOLUME
                 "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
                 "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
                 "put_delta": pg.get("delta") or 0, "put_gamma": pg.get("gamma") or 0,
@@ -260,6 +261,7 @@ def chain_from_instruments(spot):
             "strike": s_, "call_oi": c_oi, "put_oi": p_oi,
             "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
             "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
+            "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0, # <--- NEW VOLUME
             "call_symbol": ck["symbol"] if ck else "", "put_symbol": pk["symbol"] if pk else "",
             "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
             "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
@@ -355,6 +357,12 @@ def max_pain(df):
 def oi_signal(df, spot):
     tc, tp = df["call_oi"].sum(), df["put_oi"].sum()
     pcr = tp / tc if tc else 1.0
+    
+    # New Volume Calculations
+    total_cv = df["call_vol"].sum()
+    total_pv = df["put_vol"].sum()
+    vol_pcr = total_pv / total_cv if total_cv else 1.0
+
     mp = max_pain(df)
     res = df.loc[df["call_oi"].idxmax(), "strike"]
     sup = df.loc[df["put_oi"].idxmax(), "strike"]
@@ -370,7 +378,10 @@ def oi_signal(df, spot):
     if net_p > net_c: bull += 1
     elif net_c > net_p: bear += 1
     direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "NEUTRAL"
-    return dict(pcr=pcr, max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, bull=bull, bear=bear, direction=direction)
+    
+    return dict(pcr=pcr, vol_pcr=vol_pcr, total_cv=total_cv, total_pv=total_pv,
+                max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, 
+                bull=bull, bear=bear, direction=direction)
 
 def get_trade_setup(df, spot, buffer, lo, hi):
     d = df[df["has_chg"]].copy()
@@ -390,6 +401,7 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         if target_strike <= trigger_spot: target_strike = trigger_spot + 50
         opt_type = "CE"
         opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "call_delta", "call_symbol", "call_ltp", "call_iv"
+        opt_vol_col = "call_vol"
         reason = f"Bullish OI Flow. Put buildup at {top_row['strike']:g}."
     else:
         trigger_spot = top_row["strike"] - buffer
@@ -398,6 +410,7 @@ def get_trade_setup(df, spot, buffer, lo, hi):
         if target_strike >= trigger_spot: target_strike = trigger_spot - 50
         opt_type = "PE"
         opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "put_delta", "put_symbol", "put_ltp", "put_iv"
+        opt_vol_col = "put_vol"
         reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
 
     best_opt = None
@@ -419,6 +432,11 @@ def get_trade_setup(df, spot, buffer, lo, hi):
     opt_iv = best_opt[opt_iv_col] if not pd.isna(best_opt[opt_iv_col]) else 0.0
     opt_symbol = best_opt[opt_symbol_col] if best_opt[opt_symbol_col] else "Unknown"
     
+    # Volume Analysis for specific option
+    opt_vol = best_opt[opt_vol_col]
+    avg_vol = df[opt_vol_col].mean()
+    vol_confirm = "🔥 HIGH VOL" if opt_vol > avg_vol * 1.5 else "Normal"
+    
     risk = abs(trigger_spot - sl_spot)
     reward = abs(target_strike - trigger_spot)
     rr = round(reward / risk, 2) if risk > 0 else 0
@@ -426,6 +444,7 @@ def get_trade_setup(df, spot, buffer, lo, hi):
     return {
         "type": opt_type, "symbol": opt_symbol, "strike": best_opt["strike"],
         "premium": opt_premium, "delta": opt_delta, "iv": opt_iv,
+        "opt_vol": opt_vol, "vol_confirm": vol_confirm,
         "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_strike,
         "rr": rr, "reason": reason, "is_bullish": is_bullish
     }
@@ -471,8 +490,7 @@ else:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
         border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
         
-        # FIXED HTML: Tightly packed to prevent Markdown from treating it as a code block
-        card_html = f'<div class="trade-card" style="background:{bg}; border-left-color:{border};"><div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div><div><b>Strategy:</b> {setup["reason"]}</div><div class="trade-grid"><div class="trade-item"><div class="trade-label">Entry Trigger (Spot)</div><div class="trade-value">{setup["entry_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Stop Loss (Spot)</div><div class="trade-value">{setup["sl_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Target (Spot)</div><div class="trade-value">{setup["target_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Risk / Reward</div><div class="trade-value">1 : {setup["rr"]}</div></div></div><div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;"><div>📊 <b>Delta:</b> {setup["delta"]:.3f}</div><div>📈 <b>IV:</b> {setup["iv"]:.1f}%</div><div>💰 <b>Lot Size:</b> {fut.get("lot_size", "—")}</div></div></div>'
+        card_html = f'<div class="trade-card" style="background:{bg}; border-left-color:{border};"><div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div><div><b>Strategy:</b> {setup["reason"]}</div><div class="trade-grid"><div class="trade-item"><div class="trade-label">Entry Trigger (Spot)</div><div class="trade-value">{setup["entry_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Stop Loss (Spot)</div><div class="trade-value">{setup["sl_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Target (Spot)</div><div class="trade-value">{setup["target_spot"]:,.2f}</div></div><div class="trade-item"><div class="trade-label">Risk / Reward</div><div class="trade-value">1 : {setup["rr"]}</div></div></div><div style="margin-top:15px; font-size:0.9rem; display:flex; gap:20px; opacity:0.9;"><div>📊 <b>Delta:</b> {setup["delta"]:.3f}</div><div>📈 <b>IV:</b> {setup["iv"]:.1f}%</div><div>📦 <b>Strike Vol:</b> {setup["opt_vol"]:,} ({setup["vol_confirm"]})</div><div>💰 <b>Lot Size:</b> {fut.get("lot_size", "—")}</div></div></div>'
         
         st.markdown(card_html, unsafe_allow_html=True)
         
@@ -504,22 +522,30 @@ st.markdown("---")
 # CHARTS & TABLES
 # ==============================
 if chain is not None and not chain.empty:
-    # Signal Box
+    # Signal Box & Volume Metrics
     sig = oi_signal(chain, spot)
     kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
-    st.markdown(f"""<div class="pred {kls}" style="padding:10px;margin-bottom:12px"><div style="opacity:.8">Macro Option Chain Signal</div>
-      <div style="font-size:1.4rem;font-weight:800">{sig['direction']}</div>
-      <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("PCR", f"{sig['pcr']:.2f}")
-    m2.metric("Max Pain", f"{sig['max_pain']:,.0f}")
-    m3.metric("Support (max Put OI)", f"{sig['support']:,.0f}")
-    m4.metric("Resistance (max Call OI)", f"{sig['resistance']:,.0f}")
-    m5.metric("Net ΔOI Calls / Puts", f"{sig['net_c']:+,.0f} / {sig['net_p']:+,.0f}")
+    
+    col_a, col_b = st.columns([1, 3])
+    with col_a:
+        st.markdown(f"""<div class="pred {kls}" style="padding:10px;margin-bottom:12px"><div style="opacity:.8">Macro Option Signal</div>
+          <div style="font-size:1.4rem;font-weight:800">{sig['direction']}</div>
+          <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
+    
+    with col_b:
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("OI PCR", f"{sig['pcr']:.2f}")
+        m2.metric("Vol PCR", f"{sig['vol_pcr']:.2f}", help="Put Volume / Call Volume")
+        m3.metric("Max Pain", f"{sig['max_pain']:,.0f}")
+        m4.metric("Support (Put OI)", f"{sig['support']:,.0f}")
+        m5.metric("Resistance (Call OI)", f"{sig['resistance']:,.0f}")
+        m6.metric("Total Call/Put Vol", f"{sig['total_cv']:,} / {sig['total_pv']:,}")
 
     st.subheader("Open Interest by Strike")
     st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
+    
+    st.subheader("Trading Volume by Strike (Call vs Put)")
+    st.bar_chart(chain.set_index("strike")[["call_vol", "put_vol"]])
     
     st.subheader("Change in OI by Strike")
     st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
@@ -529,19 +555,19 @@ if chain is not None and not chain.empty:
 
     col1, col2 = st.columns(2)
     with col1:
-        oi_tbl = chain[["strike", "call_oi", "put_oi"]].copy()
+        oi_tbl = chain[["strike", "call_oi", "put_oi", "call_vol", "put_vol"]].copy()
         oi_tbl["OI Difference"] = (oi_tbl["put_oi"] - oi_tbl["call_oi"]).abs()
-        st.subheader("Top OI Difference")
+        st.subheader("Top OI & Volume")
         st.dataframe(oi_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1))
     
     with col2:
-        chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg"]].copy()
+        chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg", "call_vol", "put_vol"]].copy()
         chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
-        st.subheader("Top Change in OI")
+        st.subheader("Top ΔOI & Volume")
         st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1))
 
     st.subheader("Option Chain + Greeks (Nearest to Spot)")
     near = chain.iloc[(chain["strike"] - spot).abs().argsort()[:15]].sort_values("strike")
-    st.dataframe(near[["strike", "call_ltp", "call_oi", "call_delta", "call_iv", "put_ltp", "put_oi", "put_delta", "put_iv"]].reset_index(drop=True))
+    st.dataframe(near[["strike", "call_ltp", "call_oi", "call_vol", "call_delta", "call_iv", "put_ltp", "put_oi", "put_vol", "put_delta", "put_iv"]].reset_index(drop=True))
 
 st.caption(f"Last refresh: {now.strftime('%H:%M:%S IST')} · auto-refresh every 15s")
