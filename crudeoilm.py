@@ -75,8 +75,8 @@ with st.sidebar:
     risk_pct = st.number_input("Risk per trade (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
     
     st.markdown("**🎯 Risk Management**")
-    buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1, help="Distance from the OI wall to trigger entry")
-    min_gap = st.number_input("Min entry–exit gap (points)", 5, 500, 30, 5)
+    buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1, help="Distance from spot to trigger entry")
+    min_gap = st.number_input("Stop Loss distance (points)", 5, 500, 30, 5, help="Fixed distance for SL and Target calculation")
     delta_lo, delta_hi = st.slider("Option Delta Band", 0.05, 0.95, (0.30, 0.75), 0.05, help="Select ATM/OTM strikes based on Delta")
     
     st.markdown("**📊 Analytics**")
@@ -166,15 +166,31 @@ LOT_SIZE = fut.get("lot_size", 10)
 # ==============================
 @st.cache_data(ttl=300)
 def get_trend_ema(fut_key):
-    j = api_get(f"/v2/historical-candle/intraday/{quote(fut_key, safe='')}/5minute", {})
-    if j.get("status") == "success":
-        candles = j.get("data", {}).get("candles", [])
-        if len(candles) >= 20:
-            # Candles are newest first, reverse to chronological
-            df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-            df = df.iloc[::-1]
-            df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-            return df["ema_20"].iloc[-1]
+    try:
+        j = api_get(f"/v2/historical-candle/intraday/{quote(fut_key, safe='')}/5minute", {})
+        if j.get("status") == "success":
+            candles = j.get("data", {}).get("candles", [])
+            if len(candles) >= 20:
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+                df = df.iloc[::-1]
+                df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+                return df["ema_20"].iloc[-1]
+    except:
+        pass
+    
+    try:
+        end = dt.datetime.now(IST).date().isoformat()
+        start = (dt.datetime.now(IST).date() - dt.timedelta(days=30)).isoformat()
+        j = api_get(f"/v2/historical-candle/{quote(fut_key, safe='')}/day/{end}/{start}", {})
+        if j.get("status") == "success":
+            candles = j.get("data", {}).get("candles", [])
+            if len(candles) >= 20:
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+                df = df.iloc[::-1]
+                df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+                return df["ema_20"].iloc[-1]
+    except:
+        pass
     return None
 
 def get_price():
@@ -401,45 +417,63 @@ def oi_signal(df, spot):
                 max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, 
                 bull=bull, bear=bear, direction=direction)
 
-def get_trade_setup(df, spot, buffer, lo, hi, capital, risk_pct, trend_ema):
+def get_trade_setup(df, spot, buffer, min_gap, lo, hi, capital, risk_pct, trend_ema, flow_score):
     d = df[df["has_chg"]].copy()
     if d.empty: return None
-    
-    d["diff"] = (d["put_chg"] - d["call_chg"]).abs()
-    d = d.sort_values("diff", ascending=False)
-    if d.empty: return None
-    
-    top_row = d.iloc[0]
-    is_bullish = top_row["put_chg"] > top_row["call_chg"]
-    
-    if is_bullish:
-        trigger_spot = top_row["strike"] + buffer
-        sl_spot = top_row["strike"] - buffer
-        target_strike = df.loc[df["call_oi"].idxmax(), "strike"]
-        if target_strike <= trigger_spot: target_strike = trigger_spot + 50
+
+    # 1. STRICT DIRECTION FILTER based on Macro Trend
+    if flow_score < -0.2 or (trend_ema and spot < trend_ema):
+        trade_dir = "PE"
+        reason = f"Bearish Macro Flow ({flow_score:.2f}) or Below EMA. Looking for PE."
+    elif flow_score > 0.2 or (trend_ema and spot > trend_ema):
+        trade_dir = "CE"
+        reason = f"Bullish Macro Flow ({flow_score:.2f}) or Above EMA. Looking for CE."
+    else:
+        # Neutral trend, look at nearest strong OI change
+        near = df[(df["strike"] >= spot - 200) & (df["strike"] <= spot + 200)].copy()
+        if near.empty: near = df.copy()
+        near["diff"] = (near["put_chg"] - near["call_chg"]).abs()
+        top = near.sort_values("diff", ascending=False).iloc[0]
+        if top["put_chg"] > top["call_chg"]:
+            trade_dir = "CE"
+            reason = f"Neutral trend, but strong Put buildup at {top['strike']:g}."
+        else:
+            trade_dir = "PE"
+            reason = f"Neutral trend, but strong Call buildup at {top['strike']:g}."
+
+    # 2. CALCULATE TRIGGER, SL, TARGET based on Current Spot
+    if trade_dir == "CE":
+        trigger_spot = spot + buffer
+        sl_spot = spot - min_gap  # Fixed risk distance
+        # Target: Next Call OI wall above, or fixed distance
+        target_candidates = df[(df["strike"] > trigger_spot) & (df["call_oi"] > 0)].sort_values("strike")
+        if not target_candidates.empty and target_candidates.iloc[0]["strike"] <= spot + 400:
+            target_spot = target_candidates.iloc[0]["strike"]
+        else:
+            target_spot = trigger_spot + (min_gap * 2)
+            
         opt_type = "CE"
         opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "call_delta", "call_symbol", "call_ltp", "call_iv"
         opt_vol_col = "call_vol"
-        reason = f"Bullish OI Flow. Put buildup at {top_row['strike']:g}."
+        is_bullish = True
     else:
-        trigger_spot = top_row["strike"] - buffer
-        sl_spot = top_row["strike"] + buffer
-        target_strike = df.loc[df["put_oi"].idxmax(), "strike"]
-        if target_strike >= trigger_spot: target_strike = trigger_spot - 50
+        trigger_spot = spot - buffer
+        sl_spot = spot + min_gap  # Fixed risk distance
+        # Target: Next Put OI wall below, or fixed distance
+        target_candidates = df[(df["strike"] < trigger_spot) & (df["put_oi"] > 0)].sort_values("strike", ascending=False)
+        if not target_candidates.empty and target_candidates.iloc[0]["strike"] >= spot - 400:
+            target_spot = target_candidates.iloc[0]["strike"]
+        else:
+            target_spot = trigger_spot - (min_gap * 2)
+            
         opt_type = "PE"
         opt_delta_col, opt_symbol_col, opt_ltp_col, opt_iv_col = "put_delta", "put_symbol", "put_ltp", "put_iv"
         opt_vol_col = "put_vol"
-        reason = f"Bearish OI Flow. Call buildup at {top_row['strike']:g}."
+        is_bullish = False
 
-    # TREND FILTER
-    counter_trend = False
-    if trend_ema:
-        if is_bullish and spot < trend_ema: counter_trend = True
-        if not is_bullish and spot > trend_ema: counter_trend = True
-
+    # 3. FIND BEST OPTION STRIKE (Delta band)
     best_opt = None
     min_dist = float("inf")
-    
     for _, row in df.iterrows():
         delta = abs(row[opt_delta_col])
         if lo <= delta <= hi:
@@ -453,22 +487,20 @@ def get_trade_setup(df, spot, buffer, lo, hi, capital, risk_pct, trend_ema):
         
     opt_premium = best_opt[opt_ltp_col] if not pd.isna(best_opt[opt_ltp_col]) else 0.0
     opt_delta = best_opt[opt_delta_col] if not pd.isna(best_opt[opt_delta_col]) else 0.0
-    if opt_delta == 0: opt_delta = 0.5 # Fallback if Greeks missing
-    
+    if opt_delta == 0: opt_delta = 0.5
     opt_iv = best_opt[opt_iv_col] if not pd.isna(best_opt[opt_iv_col]) else 0.0
     opt_symbol = best_opt[opt_symbol_col] if best_opt[opt_symbol_col] else "Unknown"
     opt_vol = best_opt[opt_vol_col]
     
-    # PREMIUM STOP LOSS CALCULATION
+    # 4. PREMIUM SL & TARGET
     spot_risk = abs(trigger_spot - sl_spot)
     premium_risk = spot_risk * opt_delta
     premium_sl = max(1.0, opt_premium - premium_risk)
     
-    # TARGET CALCULATION (Premium)
-    spot_reward = abs(target_strike - trigger_spot)
+    spot_reward = abs(target_spot - trigger_spot)
     premium_target = opt_premium + (spot_reward * opt_delta)
 
-    # POSITION SIZING
+    # 5. POSITION SIZING
     risk_amount = capital * (risk_pct / 100)
     risk_per_lot = (opt_premium - premium_sl) * LOT_SIZE
     if risk_per_lot > 0:
@@ -481,7 +513,7 @@ def get_trade_setup(df, spot, buffer, lo, hi, capital, risk_pct, trend_ema):
     vol_confirm = "🔥 HIGH VOL" if opt_vol > avg_vol * 1.5 else "Normal"
     
     risk = abs(trigger_spot - sl_spot)
-    reward = abs(target_strike - trigger_spot)
+    reward = abs(target_spot - trigger_spot)
     rr = round(reward / risk, 2) if risk > 0 else 0
 
     return {
@@ -490,9 +522,9 @@ def get_trade_setup(df, spot, buffer, lo, hi, capital, risk_pct, trend_ema):
         "opt_vol": opt_vol, "vol_confirm": vol_confirm,
         "premium_sl": premium_sl, "premium_target": premium_target,
         "lots": lots,
-        "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_strike,
+        "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_spot,
         "rr": rr, "reason": reason, "is_bullish": is_bullish,
-        "counter_trend": counter_trend
+        "counter_trend": False # Removed because we strictly enforce trend now
     }
 
 # ==============================
@@ -507,6 +539,9 @@ if not price:
 spot = price["ltp"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
+
+# Calculate Flow first to pass to Trade Setup
+flow = compute_crude_flow()
 
 # Top Row: Price & Trend
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
@@ -527,7 +562,10 @@ with c4:
           <div style="font-size:1.2rem;font-weight:800">{t_text}</div>
           <div style="font-size:.85rem">EMA: {ema_20:,.2f}</div></div>""", unsafe_allow_html=True)
     else:
-        st.info("Trend EMA Data Unavailable")
+        st.markdown(f"""<div class="card" style="text-align:center; background:#f9a825; color:black;">
+        <div style="font-weight:bold;">Trend EMA Data Unavailable</div>
+        <div style="font-size:0.9rem;">Relying on Macro Flow Score only</div>
+        </div>""", unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -539,20 +577,15 @@ st.subheader("🎯 Actionable Options Trade Setup")
 if chain is None or chain.empty:
     st.error("Could not build option chain. Cannot generate trade setup.")
 else:
-    setup = get_trade_setup(chain, spot, buffer_pts, delta_lo, delta_hi, capital, risk_pct, ema_20)
+    setup = get_trade_setup(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi, capital, risk_pct, ema_20, flow["score"])
     
     if setup:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
         border = "#11998e" if setup["is_bullish"] else "#cb2d3e"
         
-        warning_html = ""
-        if setup["counter_trend"]:
-            warning_html = '<div style="margin-top:10px;"><span class="warn-badge">⚠️ WARNING: This trade is against the 20 EMA Trend. Trade with caution.</span></div>'
-        
         card_html = f'''<div class="trade-card" style="background:{bg}; border-left-color:{border};">
 <div class="trade-header">🟢 BUY {setup["symbol"]} @ {setup["premium"]:.2f}</div>
 <div><b>Strategy:</b> {setup["reason"]}</div>
-{warning_html}
 <div class="trade-grid">
 <div class="trade-item"><div class="trade-label">Entry Premium</div><div class="trade-value">₹ {setup["premium"]:.2f}</div></div>
 <div class="trade-item"><div class="trade-label">Premium SL</div><div class="trade-value">₹ {setup["premium_sl"]:.2f}</div></div>
@@ -584,7 +617,6 @@ st.markdown("---")
 # ==============================
 # FUTURES OI FLOW UI
 # ==============================
-flow = compute_crude_flow()
 if flow["rows"]:
     st.subheader(f"🌊 CRUDEOILM Futures OI Flow — Macro Score: {flow['score']:.2f}")
     bias = "Bullish" if flow["score"] > 0 else ("Bearish" if flow["score"] < 0 else "Sideways")
