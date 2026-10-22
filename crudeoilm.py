@@ -177,7 +177,7 @@ def get_trend_ema(fut_key):
                 return df["ema_20"].iloc[-1]
     except:
         pass
-    return None # Return None if intraday fails (no daily fallback!)
+    return None # Return None if intraday fails
 
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -538,18 +538,22 @@ with c1:
       <div class="{cls}">{arrow} {price['chg']:+,.2f} ({price['pct']:+.2f}%)</div>
       <div style="font-size:.8rem;color:#888">Prev: {price['prev']:,.2f}</div></div>""", unsafe_allow_html=True)
 with c2:
-    st.markdown(f"""<div class="card"><div style="color:#666">Day High</div><div style="font-size:1.2rem;font-weight:bold">{price['high'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="card"><div style="color:#666">Day High</div><div style="font-size:1.2rem;font-weight:bold">{(price['high'] or 0):,.2f}</div></div>""", unsafe_allow_html=True)
 with c3:
-    st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{(price['low'] or 0):,.2f}</div></div>""", unsafe_allow_html=True)
 with c4:
     # Show Intraday Trend Status
     is_below_open = spot < day_open if day_open else False
     t_color = "bearish" if is_below_open else "bullish"
     t_text = "BEARISH (Below Open)" if is_below_open else "BULLISH (Above Open)"
     
+    # FIXED: Pre-calculate the string to avoid f-string format errors
+    ema_str = f"{ema_20:,.2f}" if ema_20 else "N/A"
+    open_str = f"{day_open:,.2f}" if day_open else "N/A"
+    
     st.markdown(f"""<div class="pred {t_color}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Intraday Trend Filter</div>
       <div style="font-size:1.2rem;font-weight:800">{t_text}</div>
-      <div style="font-size:.85rem">Open: {day_open:,.2f} | EMA: {ema_20:,.2f if ema_20 else 'N/A'}</div></div>""", unsafe_allow_html=True)
+      <div style="font-size:.85rem">Open: {open_str} | EMA: {ema_str}</div></div>""", unsafe_allow_html=True)
 
 st.markdown("---")
 
