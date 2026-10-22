@@ -56,7 +56,7 @@ if not access_token.startswith("Bearer "):
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": access_token}
 
 # ==============================
-# STYLES (Copied exactly from reference)
+# STYLES
 # ==============================
 st.markdown("""
     <style>
@@ -304,7 +304,6 @@ def _fetch_prev_oi(key, day_iso):
     return True, None
 
 def fetch_oi_data():
-    """Builds the standard OI list required by the reference logic."""
     rows = []
     if not opt_chain_raw or opt_chain_raw.get("status") != "success":
         return []
@@ -321,7 +320,6 @@ def fetch_oi_data():
         c_oi = cm.get("oi") or 0
         p_oi = pm.get("oi") or 0
         
-        # Need change OI
         c_key = c.get("instrument_key")
         p_key = p.get("instrument_key")
         
@@ -494,7 +492,7 @@ def entry_status_text(sig): return sig.get("status_label") or ("ACTIVE" if sig.g
 
 def apply_signal_gate(index_name, entry, spot_price, macro_score, flip=None):
     key = f"gate_state_{index_name}"
-    now_dt = datetime.now(ist)
+    now_dt = dt.datetime.now(IST) # FIXED HERE
     today_key = now_dt.strftime("%Y-%m-%d")
     state = st.session_state.get(key)
     if not state or state.get("date") != today_key:
@@ -584,7 +582,7 @@ def apply_signal_gate(index_name, entry, spot_price, macro_score, flip=None):
     return out, status
 
 def compute_oi_flip_meter(index_name, change_oi_list, spot_price, greeks_map):
-    now_dt = datetime.now(ist)
+    now_dt = dt.datetime.now(IST) # FIXED HERE
     res = {"available": False, "score": 0.0, "state": "NO DATA", "flip": None, "flip_since": None, "flip_from": None, "msg": "", "atm": None, "history": [], "n_strikes": 0}
     if spot_price <= 0 or not change_oi_list:
         res["msg"] = "Change-in-OI data not available."
@@ -723,7 +721,6 @@ oi_prediction = compute_oi_prediction(oi_data, spot, oi_data, macro_score)
 # ==============================
 st.title("🛢️ CRUDEOILM Analytics & Strategy Suite — Pro")
 
-# Top Row: Price & Trend
 c1, c2, c3, c4 = st.columns([2, 1, 1, 1.5])
 with c1:
     st.markdown(f"""<div class="market-box"><div style="color:#666">CRUDEOILM (Fut)</div>
@@ -800,7 +797,6 @@ if entry_signal:
     <div style="margin-top: 8px; font-size: 0.95rem; opacity: 0.9;"><span>📊 Current: <b>{spot:,.2f}</b> | Strike: <b>{entry_signal['strike']}</b> | OI Diff: <b>{entry_signal['oi_diff']:,.0f}</b></span>
     <span style="margin-left: 20px;">📌 {entry_signal['reason']}</span></div></div>''', unsafe_allow_html=True)
     
-    # Greeks Panel
     if entry_signal.get("greeks"):
         g = entry_signal["greeks"]
         leg = "PUT" if entry_signal["high_type"] == "HIGH PUT" else "CALL"
@@ -845,8 +841,7 @@ else:
 
 st.markdown("---")
 
-# OI Data Table
-st.subheader("Nifty Open Interest Data")
+st.subheader("CRUDEOILM Open Interest Data")
 if oi_data:
     df_oi = pd.DataFrame(oi_data)
     df_oi["OI Difference"] = (df_oi["put_oi"] - df_oi["call_oi"]).abs()
@@ -855,7 +850,6 @@ if oi_data:
 else:
     st.info("No OI data available.")
 
-# Prediction Cards (Code 2, 3, 4)
 st.markdown("---")
 st.subheader("📊 Prediction Models")
 col2, col3, col4 = st.columns(3)
