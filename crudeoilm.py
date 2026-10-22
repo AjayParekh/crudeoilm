@@ -53,7 +53,7 @@ st.markdown("""
       background:#e9ecef;color:#333;margin-right:6px}
 .trade-card{padding:20px;border-radius:12px;margin-bottom:14px;border-left:8px solid;color:white;box-shadow: 0 4px 15px rgba(0,0,0,0.2);}
 .trade-header{font-size:1.8rem;font-weight:900;margin-bottom:10px;}
-.trade-grid{display:grid; grid-template-columns: repeat(4, 1fr); gap: 15px; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; margin-top: 10px;}
+.trade-grid{display:grid;grid-template-columns: repeat(4, 1fr); gap: 15px; background: rgba(0,0,0,0.2); padding: 15px; border-radius: 8px; margin-top: 10px;}
 .trade-item{text-align:center;}
 .trade-label{font-size:0.8rem; opacity:0.8; text-transform:uppercase; letter-spacing:1px;}
 .trade-value{font-size:1.3rem; font-weight:bold;}
@@ -76,7 +76,7 @@ with st.sidebar:
     
     st.markdown("**🎯 Risk Management**")
     buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1, help="Distance from spot to trigger entry")
-    min_gap = st.number_input("Stop Loss distance (points)", 5, 500, 30, 5, help="Fixed distance for SL and Target calculation")
+    min_gap = st.number_input("Stop Loss distance (points)", 5, 500, 30, 5, help="Fixed distance for SL calculation")
     delta_lo, delta_hi = st.slider("Option Delta Band", 0.05, 0.95, (0.30, 0.75), 0.05, help="Select ATM/OTM strikes based on Delta")
     
     st.markdown("**📊 Analytics**")
@@ -162,7 +162,7 @@ FUT_KEY = fut["key"]
 LOT_SIZE = fut.get("lot_size", 10)
 
 # ==============================
-# PRICE & TREND (20 EMA)
+# PRICE & TREND (Strict Intraday)
 # ==============================
 @st.cache_data(ttl=300)
 def get_trend_ema(fut_key):
@@ -177,21 +177,7 @@ def get_trend_ema(fut_key):
                 return df["ema_20"].iloc[-1]
     except:
         pass
-    
-    try:
-        end = dt.datetime.now(IST).date().isoformat()
-        start = (dt.datetime.now(IST).date() - dt.timedelta(days=30)).isoformat()
-        j = api_get(f"/v2/historical-candle/{quote(fut_key, safe='')}/day/{end}/{start}", {})
-        if j.get("status") == "success":
-            candles = j.get("data", {}).get("candles", [])
-            if len(candles) >= 20:
-                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
-                df = df.iloc[::-1]
-                df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-                return df["ema_20"].iloc[-1]
-    except:
-        pass
-    return None
+    return None # Return None if intraday fails (no daily fallback!)
 
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -417,35 +403,36 @@ def oi_signal(df, spot):
                 max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, 
                 bull=bull, bear=bear, direction=direction)
 
-def get_trade_setup(df, spot, buffer, min_gap, lo, hi, capital, risk_pct, trend_ema, flow_score):
-    d = df[df["has_chg"]].copy()
-    if d.empty: return None
+def get_trade_setup(df, spot, buffer, min_gap, lo, hi, capital, risk_pct, trend_ema, flow_score, day_open):
+    # 1. STRICT DIRECTION FILTER (Intraday Price Action first)
+    is_bearish = False
+    
+    # Primary Filter: Is the price below today's open?
+    if day_open and spot < day_open:
+        is_bearish = True
+    # Secondary Filter: Is it below the 5-min EMA?
+    elif trend_ema and spot < trend_ema:
+        is_bearish = True
+    # Fallback: Macro flow
+    elif flow_score < -0.2:
+        is_bearish = True
+        
+    # Only override to bullish if the flow is heavily bullish AND price is above open
+    if flow_score > 0.5 and day_open and spot > day_open:
+        is_bearish = False
 
-    # 1. STRICT DIRECTION FILTER based on Macro Trend
-    if flow_score < -0.2 or (trend_ema and spot < trend_ema):
-        trade_dir = "PE"
-        reason = f"Bearish Macro Flow ({flow_score:.2f}) or Below EMA. Looking for PE."
-    elif flow_score > 0.2 or (trend_ema and spot > trend_ema):
-        trade_dir = "CE"
-        reason = f"Bullish Macro Flow ({flow_score:.2f}) or Above EMA. Looking for CE."
+    trade_dir = "PE" if is_bearish else "CE"
+    
+    if is_bearish:
+        reason = f"Intraday Bearish (Spot < Open/EMA). Looking for PE."
     else:
-        # Neutral trend, look at nearest strong OI change
-        near = df[(df["strike"] >= spot - 200) & (df["strike"] <= spot + 200)].copy()
-        if near.empty: near = df.copy()
-        near["diff"] = (near["put_chg"] - near["call_chg"]).abs()
-        top = near.sort_values("diff", ascending=False).iloc[0]
-        if top["put_chg"] > top["call_chg"]:
-            trade_dir = "CE"
-            reason = f"Neutral trend, but strong Put buildup at {top['strike']:g}."
-        else:
-            trade_dir = "PE"
-            reason = f"Neutral trend, but strong Call buildup at {top['strike']:g}."
+        reason = f"Intraday Bullish (Spot > Open/EMA). Looking for CE."
 
     # 2. CALCULATE TRIGGER, SL, TARGET based on Current Spot
     if trade_dir == "CE":
         trigger_spot = spot + buffer
-        sl_spot = spot - min_gap  # Fixed risk distance
-        # Target: Next Call OI wall above, or fixed distance
+        sl_spot = spot - min_gap
+        # Target: Next Call OI wall above
         target_candidates = df[(df["strike"] > trigger_spot) & (df["call_oi"] > 0)].sort_values("strike")
         if not target_candidates.empty and target_candidates.iloc[0]["strike"] <= spot + 400:
             target_spot = target_candidates.iloc[0]["strike"]
@@ -458,8 +445,8 @@ def get_trade_setup(df, spot, buffer, min_gap, lo, hi, capital, risk_pct, trend_
         is_bullish = True
     else:
         trigger_spot = spot - buffer
-        sl_spot = spot + min_gap  # Fixed risk distance
-        # Target: Next Put OI wall below, or fixed distance
+        sl_spot = spot + min_gap
+        # Target: Next Put OI wall below
         target_candidates = df[(df["strike"] < trigger_spot) & (df["put_oi"] > 0)].sort_values("strike", ascending=False)
         if not target_candidates.empty and target_candidates.iloc[0]["strike"] >= spot - 400:
             target_spot = target_candidates.iloc[0]["strike"]
@@ -523,8 +510,7 @@ def get_trade_setup(df, spot, buffer, min_gap, lo, hi, capital, risk_pct, trend_
         "premium_sl": premium_sl, "premium_target": premium_target,
         "lots": lots,
         "entry_spot": trigger_spot, "sl_spot": sl_spot, "target_spot": target_spot,
-        "rr": rr, "reason": reason, "is_bullish": is_bullish,
-        "counter_trend": False # Removed because we strictly enforce trend now
+        "rr": rr, "reason": reason, "is_bullish": is_bullish
     }
 
 # ==============================
@@ -537,6 +523,7 @@ if not price:
     st.stop()
 
 spot = price["ltp"]
+day_open = price["open"]
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
 
@@ -555,17 +542,14 @@ with c2:
 with c3:
     st.markdown(f"""<div class="card"><div style="color:#666">Day Low</div><div style="font-size:1.2rem;font-weight:bold">{price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
 with c4:
-    if ema_20:
-        t_color = "bullish" if spot > ema_20 else "bearish"
-        t_text = "BULLISH (Above EMA)" if spot > ema_20 else "BEARISH (Below EMA)"
-        st.markdown(f"""<div class="pred {t_color}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Trend Filter (20 EMA)</div>
-          <div style="font-size:1.2rem;font-weight:800">{t_text}</div>
-          <div style="font-size:.85rem">EMA: {ema_20:,.2f}</div></div>""", unsafe_allow_html=True)
-    else:
-        st.markdown(f"""<div class="card" style="text-align:center; background:#f9a825; color:black;">
-        <div style="font-weight:bold;">Trend EMA Data Unavailable</div>
-        <div style="font-size:0.9rem;">Relying on Macro Flow Score only</div>
-        </div>""", unsafe_allow_html=True)
+    # Show Intraday Trend Status
+    is_below_open = spot < day_open if day_open else False
+    t_color = "bearish" if is_below_open else "bullish"
+    t_text = "BEARISH (Below Open)" if is_below_open else "BULLISH (Above Open)"
+    
+    st.markdown(f"""<div class="pred {t_color}" style="padding:10px;margin-bottom:0"><div style="opacity:.8">Intraday Trend Filter</div>
+      <div style="font-size:1.2rem;font-weight:800">{t_text}</div>
+      <div style="font-size:.85rem">Open: {day_open:,.2f} | EMA: {ema_20:,.2f if ema_20 else 'N/A'}</div></div>""", unsafe_allow_html=True)
 
 st.markdown("---")
 
@@ -577,7 +561,7 @@ st.subheader("🎯 Actionable Options Trade Setup")
 if chain is None or chain.empty:
     st.error("Could not build option chain. Cannot generate trade setup.")
 else:
-    setup = get_trade_setup(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi, capital, risk_pct, ema_20, flow["score"])
+    setup = get_trade_setup(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi, capital, risk_pct, ema_20, flow["score"], day_open)
     
     if setup:
         bg = "linear-gradient(135deg, #11998e, #38ef7d)" if setup["is_bullish"] else "linear-gradient(135deg, #cb2d3e, #ef473a)"
