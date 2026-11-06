@@ -453,6 +453,105 @@ def entry_exit(df, spot, buffer, gap, lo, hi, max_candidates=5):
     return entry, exit_
 
 
+def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
+    """Directional score from OI-change patterns around ATM.
+    Components: top ΔOI-diff strikes, ATM, 1-up OTM (call), 1-down OTM (put), ITM options.
+    Positive final = bullish (put writing), negative = bearish (call writing)."""
+    d = chain[chain["has_chg"]].copy()
+    if d.empty or len(d) < 3:
+        return None
+
+    strikes = sorted(d["strike"].unique())
+    atm = min(strikes, key=lambda s: abs(s - spot))
+    atm_idx = strikes.index(atm)
+
+    def get_row(s):
+        return d[d["strike"] == s].iloc[0]
+
+    d["pc_diff"] = d["put_chg"].astype(float) - d["call_chg"].astype(float)
+    d["abs_diff"] = d["pc_diff"].abs()
+
+    # 1) Top ΔOI difference strikes (weighted by |diff|)
+    top = d.nlargest(top_n_strikes, "abs_diff")
+    top_raw = (float((top["pc_diff"] * top["abs_diff"]).sum() / top["abs_diff"].sum())
+               if top["abs_diff"].sum() > 0 else 0.0)
+
+    # 2) ATM
+    r = get_row(atm)
+    atm_raw = float(r["put_chg"]) - float(r["call_chg"])
+
+    # 3) 1-up strike (call is OTM here)
+    up_strike = strikes[atm_idx + 1] if atm_idx + 1 < len(strikes) else None
+    if up_strike is not None:
+        r = get_row(up_strike)
+        up_raw = float(r["put_chg"]) - float(r["call_chg"])
+    else:
+        up_raw = 0.0
+
+    # 4) 1-down strike (put is OTM here)
+    down_strike = strikes[atm_idx - 1] if atm_idx - 1 >= 0 else None
+    if down_strike is not None:
+        r = get_row(down_strike)
+        down_raw = float(r["put_chg"]) - float(r["call_chg"])
+    else:
+        down_raw = 0.0
+
+    # 5) ITM (nearest N calls below spot + nearest N puts above spot)
+    itm_call_strikes = [s for s in strikes if s < spot][-itm_count:]
+    itm_put_strikes  = [s for s in strikes if s > spot][:itm_count]
+    itm_call_avg = (sum(float(get_row(s)["call_chg"]) for s in itm_call_strikes)
+                    / len(itm_call_strikes)) if itm_call_strikes else 0.0
+    itm_put_avg  = (sum(float(get_row(s)["put_chg"]) for s in itm_put_strikes)
+                    / len(itm_put_strikes)) if itm_put_strikes else 0.0
+    itm_raw = itm_put_avg - itm_call_avg
+
+    # Normalise per-strike ΔOI to [-1, 1]
+    scale = max(float(d["call_chg"].abs().max()),
+                float(d["put_chg"].abs().max()), 1.0)
+
+    def clip(x): return max(-1.0, min(1.0, x))
+
+    norm = {
+        "Top ΔOI diff":  clip(top_raw  / scale),
+        "ATM":           clip(atm_raw  / scale),
+        "1↑ OTM (call)": clip(up_raw   / scale),
+        "1↓ OTM (put)":  clip(down_raw / scale),
+        "ITM":           clip(itm_raw  / scale),
+    }
+    weights = {
+        "Top ΔOI diff":  0.30,
+        "ATM":           0.20,
+        "1↑ OTM (call)": 0.15,
+        "1↓ OTM (put)":  0.15,
+        "ITM":           0.20,
+    }
+
+    final = clip(sum(norm[k] * weights[k] for k in norm))
+
+    if abs(final) <= 0.15:
+        direction, strength = "NEUTRAL", "—"
+    elif final > 0:
+        direction = "BULLISH"
+        strength = "STRONG" if final > 0.5 else "MODERATE" if final > 0.3 else "WEAK"
+    else:
+        direction = "BEARISH"
+        strength = "STRONG" if final < -0.5 else "MODERATE" if final < -0.3 else "WEAK"
+
+    return {
+        "final": final, "pct": round(final * 100, 1),
+        "direction": direction, "strength": strength,
+        "atm": atm, "up_strike": up_strike, "down_strike": down_strike,
+        "itm_call_strikes": itm_call_strikes, "itm_put_strikes": itm_put_strikes,
+        "norm": norm, "weights": weights,
+        "raw": {
+            "Top ΔOI diff": top_raw, "ATM": atm_raw,
+            "1↑ OTM (call)": up_raw, "1↓ OTM (put)": down_raw, "ITM": itm_raw,
+        },
+        "top_table": top[["strike", "call_chg", "put_chg", "pc_diff"]].reset_index(drop=True),
+        "chain": d,
+    }
+
+
 def signal_box(title, s, spot, label):
     emoji = "🟢" if s["signal"] == "BUY" else "🔴"
     if s["active"]:
@@ -568,6 +667,98 @@ chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
 st.subheader("Change in OI (top by difference)")
 st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True)
              .style.apply(hl_top5, axis=1))
+
+# ---- Directional Score (OI change patterns) ----
+st.subheader("🎯 Directional Score — OI Change Patterns")
+ds = compute_directional_score(chain, spot)
+
+if ds:
+    cls_map   = {"BULLISH": "bullish", "BEARISH": "bearish", "NEUTRAL": "neutral"}
+    emoji_map = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+
+    st.markdown(f"""
+    <div class="pred {cls_map[ds['direction']]}">
+      <div style="opacity:.85;font-size:.9rem">OI-Change Directional Score</div>
+      <div style="font-size:2.4rem;font-weight:800;margin:6px 0">
+        {emoji_map[ds['direction']]} {ds['direction']}
+        <span style="font-size:1.1rem;opacity:.9">({ds['strength']})</span>
+      </div>
+      <div style="font-size:1.15rem">Score: {ds['final']:+.2f}  ({ds['pct']:+.1f}%)</div>
+      <div style="font-size:.85rem;margin-top:8px">
+        ATM <b>{ds['atm']:g}</b> ·
+        1↑ OTM call <b>{ds['up_strike'] if ds['up_strike'] is not None else '—'}</b> ·
+        1↓ OTM put <b>{ds['down_strike'] if ds['down_strike'] is not None else '—'}</b>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_a, col_b = st.columns([3, 2])
+
+    with col_a:
+        st.markdown("**Score breakdown**")
+        breakdown = pd.DataFrame([
+            {
+                "Component":     k,
+                "Raw ΔPut−ΔCall": round(ds["raw"][k], 0),
+                "Normalized":    round(ds["norm"][k], 2),
+                "Weight":        ds["weights"][k],
+                "Contribution":  round(ds["norm"][k] * ds["weights"][k], 3),
+            }
+            for k in ds["norm"]
+        ])
+        st.dataframe(breakdown.reset_index(drop=True))
+
+    with col_b:
+        st.markdown("**How to read**")
+        st.markdown("""
+- **Put ΔOI ↑** → put writing → 🟢 bullish (support)
+- **Call ΔOI ↑** → call writing → 🔴 bearish (resistance)
+- **ITM calls** (below spot) ΔOI ↑ → 🔴 bearish
+- **ITM puts** (above spot) ΔOI ↑ → 🟢 bullish
+- **1↑ OTM call** ΔOI ↑ → 🔴 resistance above
+- **1↓ OTM put** ΔOI ↑ → 🟢 support below
+- **Top ΔOI diff** = highest-conviction strikes
+""")
+
+    st.markdown("**Top ΔOI difference strikes (used in score)**")
+    tt = ds["top_table"].copy()
+    tt["Bias"] = tt["pc_diff"].apply(
+        lambda x: "🟢 Bullish (put writing)" if x > 0
+        else ("🔴 Bearish (call writing)" if x < 0 else "—")
+    )
+    tt = tt.rename(columns={
+        "strike": "Strike", "call_chg": "Call ΔOI",
+        "put_chg": "Put ΔOI", "pc_diff": "ΔPut − ΔCall"
+    })
+    st.dataframe(tt.reset_index(drop=True))
+
+    st.markdown("**ITM / 1-step OTM strike detail**")
+    rows = []
+    for s in ds["itm_call_strikes"]:
+        r = ds["chain"][ds["chain"]["strike"] == s].iloc[0]
+        rows.append({"Strike": s, "Class": "ITM Call (below spot)",
+                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
+                     "Bias": "🔴 Bearish" if r["call_chg"] > 0 else "🟢 Bullish"})
+    for s in ds["itm_put_strikes"]:
+        r = ds["chain"][ds["chain"]["strike"] == s].iloc[0]
+        rows.append({"Strike": s, "Class": "ITM Put (above spot)",
+                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
+                     "Bias": "🟢 Bullish" if r["put_chg"] > 0 else "🔴 Bearish"})
+    if ds["up_strike"] is not None:
+        r = ds["chain"][ds["chain"]["strike"] == ds["up_strike"]].iloc[0]
+        rows.append({"Strike": ds["up_strike"], "Class": "1↑ OTM Call",
+                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
+                     "Bias": "🔴 Bearish" if r["call_chg"] > 0 else "🟢 Bullish"})
+    if ds["down_strike"] is not None:
+        r = ds["chain"][ds["chain"]["strike"] == ds["down_strike"]].iloc[0]
+        rows.append({"Strike": ds["down_strike"], "Class": "1↓ OTM Put",
+                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
+                     "Bias": "🟢 Bullish" if r["put_chg"] > 0 else "🔴 Bearish"})
+    if rows:
+        st.dataframe(pd.DataFrame(rows).reset_index(drop=True))
+
+else:
+    st.info("Directional score needs at least 3 strikes with change-in-OI data.")
 
 # ---- OI Flow / Macro score ----
 flow = compute_crude_flow()
