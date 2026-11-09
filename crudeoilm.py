@@ -150,7 +150,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE & BNO DATA
+# PRICE, BNO & USD/INR DATA
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -176,19 +176,35 @@ def get_price():
         return None
 
 @st.cache_data(ttl=15)
-def get_bno_data():
+def get_macro_data():
     try:
+        # Fetch BNO (Brent Oil ETF) and USD/INR simultaneously
         r = requests.post("https://scanner.tradingview.com/global/scan",
-                          json={"symbols": {"tickers": ["AMEX:BNO"], "query": {"types": []}},
+                          json={"symbols": {"tickers": ["AMEX:BNO", "FX_IDC:USDINR"], "query": {"types": []}},
                                 "columns": ["close", "change", "change_abs"]},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        d = r.json()["data"][0]["d"]
-        return {"ltp": d[0], "pct": d[1], "chg": d[2], "src": "TradingView"}
+        data = r.json()["data"]
+        
+        bno_d = data[0]["d"]
+        inr_d = data[1]["d"]
+        
+        bno_pct = bno_d[1]
+        inr_pct = inr_d[1]
+        
+        # Calculate Currency-Adjusted BNO % Change
+        # Formula: ((1 + BNO%) * (1 + USDINR%)) - 1
+        adjusted_bno_pct = (((1 + bno_pct/100) * (1 + inr_pct/100)) - 1) * 100
+        
+        return {
+            "bno_ltp": bno_d[0], "bno_pct": bno_pct, "bno_chg": bno_d[2],
+            "inr_ltp": inr_d[0], "inr_pct": inr_pct, "inr_chg": inr_d[2],
+            "adjusted_bno_pct": adjusted_bno_pct
+        }
     except Exception:
         return None
 
 price = get_price()
-bno = get_bno_data()
+macro = get_macro_data()
 
 # ==============================
 # OPTION CHAIN
@@ -489,17 +505,14 @@ def entry_exit(df, spot, buffer, gap, lo, hi, max_candidates=5):
 # ==============================
 # MASTER CONFLUENCE ENGINE
 # ==============================
-def compute_master_confluence(price, chain, ds, bno):
-    # 1. OI Score
+def compute_master_confluence(price, chain, ds, macro):
     oi_score = ds["final"] if ds else 0.0
     
-    # 2. Volume Score
     tc_vol = chain["call_vol"].sum()
     tp_vol = chain["put_vol"].sum()
     tot_vol = tc_vol + tp_vol
     vol_score = ((tp_vol - tc_vol) / tot_vol) if tot_vol > 0 else 0.0
     
-    # 3. Price Action Score
     pa_score = 0.0
     if price:
         ltp = price["ltp"]
@@ -510,15 +523,15 @@ def compute_master_confluence(price, chain, ds, bno):
         elif ltp > open_px: pa_score = 0.5
         elif ltp < open_px: pa_score = -0.5
 
-    # 4. BNO Gap Score
+    # Currency-Adjusted BNO Gap Score
     bno_score = 0.0
-    if bno and price:
-        gap = abs(price["pct"] - bno["pct"])
+    if macro and price:
+        adjusted_bno_pct = macro["adjusted_bno_pct"]
+        gap = abs(price["pct"] - adjusted_bno_pct)
         if gap > 0.50:
-            if bno["pct"] > price["pct"]: bno_score = 1.0  # BNO higher -> Crude will catch up
-            elif bno["pct"] < price["pct"]: bno_score = -1.0 # BNO lower -> Crude will drop
+            if adjusted_bno_pct > price["pct"]: bno_score = 1.0  # Adjusted BNO higher -> MCX will rise
+            elif adjusted_bno_pct < price["pct"]: bno_score = -1.0 # Adjusted BNO lower -> MCX will drop
 
-    # Combine (OI 30%, Volume 20%, PA 30%, BNO 20%)
     final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (bno_score * 0.2)
 
     decision = "NO TRADE"
@@ -574,22 +587,33 @@ with c3:
       <div style="font-size:1.1rem">OI {price['oi'] if price['oi'] is not None else '—'}<br>
       Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
 with c4:
-    if bno:
-        b_cls = "pos" if bno["chg"] > 0 else "neg" if bno["chg"] < 0 else ""
-        st.markdown(f"""<div class="card"><div style="color:#666">US Brent Oil (BNO)</div>
-          <div class="big">{bno['ltp']:,.2f}</div>
-          <div class="{b_cls}">{bno['chg']:+,.2f} ({bno['pct']:+.2f}%)</div></div>""", unsafe_allow_html=True)
+    if macro:
+        b_cls = "pos" if macro["bno_chg"] > 0 else "neg" if macro["bno_chg"] < 0 else ""
+        i_cls = "pos" if macro["inr_chg"] > 0 else "neg" if macro["inr_chg"] < 0 else ""
+        st.markdown(f"""<div class="card"><div style="color:#666">US BNO & USD/INR</div>
+          <div style="font-size:1.1rem;display:flex;justify-content:space-between">
+            <span>BNO: <b class="{b_cls}">{macro['bno_pct']:+.2f}%</b></span>
+            <span>INR: <b class="{i_cls}">{macro['inr_pct']:+.2f}%</b></span>
+          </div>
+          <div style="font-size:.8rem;color:#888;margin-top:4px">Adj. Expected: {macro['adjusted_bno_pct']:+.2f}%</div>
+          </div>""", unsafe_allow_html=True)
     else:
-        st.markdown(f"""<div class="card"><div style="color:#666">US Brent Oil (BNO)</div><div>Data unavailable</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable</div></div>""", unsafe_allow_html=True)
 
-# BNO Gap Alert
-if bno and price:
-    gap_val = abs(price["pct"] - bno["pct"])
+# Currency Adjusted BNO Gap Alert
+if macro and price:
+    adjusted_bno_pct = macro["adjusted_bno_pct"]
+    gap_val = abs(price["pct"] - adjusted_bno_pct)
+    
+    st.markdown("---")
     if gap_val > 0.50:
-        if bno["pct"] < price["pct"]:
-            st.error(f"🚨 **BNO GAP ALERT**: US BNO is **{bno['pct']:.2f}%** while CRUDEOILM is **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to drop to fill the gap.")
+        if adjusted_bno_pct < price["pct"]:
+            st.error(f"🚨 **CURRENCY-ADJUSTED GAP ALERT**: US BNO is **{macro['bno_pct']:.2f}%**, USD/INR is **{macro['inr_pct']:.2f}%** (Expected MCX: {adjusted_bno_pct:.2f}%). MCX is at **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to **drop** to fill the gap.")
         else:
-            st.success(f"🚨 **BNO GAP ALERT**: US BNO is **{bno['pct']:.2f}%** while CRUDEOILM is **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to rise to fill the gap.")
+            st.success(f"🚨 **CURRENCY-ADJUSTED GAP ALERT**: US BNO is **{macro['bno_pct']:.2f}%**, USD/INR is **{macro['inr_pct']:.2f}%** (Expected MCX: {adjusted_bno_pct:.2f}%). MCX is at **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to **rise** to fill the gap.")
+    else:
+        st.info(f"✅ BNO and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
+    st.markdown("---")
 
 if chain is None or chain.empty:
     st.error("Could not build the option chain (or Liquidity Filter removed all strikes).")
@@ -603,7 +627,7 @@ sig = oi_signal(chain, spot)
 
 # Compute Scores
 ds = compute_directional_score(chain, spot)
-master = compute_master_confluence(price, chain, ds, bno)
+master = compute_master_confluence(price, chain, ds, macro)
 
 # ==============================
 # MASTER CONFLUENCE DASHBOARD
@@ -626,7 +650,7 @@ else:
     st.info("⚪ **NO TRADE** — Indicators are conflicting. The market might be trapping OI writers. Wait for alignment.")
 
 # ==============================
-# OI CHARTS & TABLES (RESTORED)
+# OI CHARTS & TABLES
 # ==============================
 st.subheader("Open Interest by Strike")
 st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
@@ -673,7 +697,7 @@ if ds:
         """)
 
 # ==============================
-# FUTURES OI FLOW (RESTORED)
+# FUTURES OI FLOW
 # ==============================
 flow = compute_crude_flow()
 if flow["rows"]:
