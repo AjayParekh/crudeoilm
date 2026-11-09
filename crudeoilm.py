@@ -150,7 +150,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE (PRICE ACTION)
+# PRICE & BNO DATA
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -164,7 +164,6 @@ def get_price():
         return {"ltp": last, "chg": chg, "pct": pct, "prev": prev,
                 "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"),
                 "oi": q.get("oi"), "volume": q.get("volume"), "src": "Upstox"}
-    # Fallback TV
     try:
         r = requests.post("https://scanner.tradingview.com/global/scan",
                           json={"symbols": {"tickers": ["MCX:CRUDEOILM1!"], "query": {"types": []}},
@@ -176,10 +175,23 @@ def get_price():
     except Exception:
         return None
 
+@st.cache_data(ttl=15)
+def get_bno_data():
+    try:
+        r = requests.post("https://scanner.tradingview.com/global/scan",
+                          json={"symbols": {"tickers": ["AMEX:BNO"], "query": {"types": []}},
+                                "columns": ["close", "change", "change_abs"]},
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        d = r.json()["data"][0]["d"]
+        return {"ltp": d[0], "pct": d[1], "chg": d[2], "src": "TradingView"}
+    except Exception:
+        return None
+
 price = get_price()
+bno = get_bno_data()
 
 # ==============================
-# OPTION CHAIN (WITH VOLUME & LIQUIDITY)
+# OPTION CHAIN
 # ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
@@ -293,11 +305,8 @@ def get_chain():
 
 chain, chain_err, chain_src, chain_raw = get_chain()
 
-# ==============================
 # LIQUIDITY FILTER
-# ==============================
 if chain is not None:
-    # Filter out illiquid strikes where both OI and Volume are extremely low
     chain = chain[
         ((chain["call_oi"] > min_liquidity) | (chain["put_oi"] > min_liquidity)) &
         ((chain["call_vol"] > min_liquidity) | (chain["put_vol"] > min_liquidity))
@@ -480,17 +489,17 @@ def entry_exit(df, spot, buffer, gap, lo, hi, max_candidates=5):
 # ==============================
 # MASTER CONFLUENCE ENGINE
 # ==============================
-def compute_master_confluence(price, chain, ds):
-    # 1. OI Score (-1 to +1)
+def compute_master_confluence(price, chain, ds, bno):
+    # 1. OI Score
     oi_score = ds["final"] if ds else 0.0
     
-    # 2. Volume Score (-1 to +1) -> Put Vol vs Call Vol
+    # 2. Volume Score
     tc_vol = chain["call_vol"].sum()
     tp_vol = chain["put_vol"].sum()
     tot_vol = tc_vol + tp_vol
     vol_score = ((tp_vol - tc_vol) / tot_vol) if tot_vol > 0 else 0.0
     
-    # 3. Price Action Score (-1 to +1)
+    # 3. Price Action Score
     pa_score = 0.0
     if price:
         ltp = price["ltp"]
@@ -501,10 +510,17 @@ def compute_master_confluence(price, chain, ds):
         elif ltp > open_px: pa_score = 0.5
         elif ltp < open_px: pa_score = -0.5
 
-    # Combine
-    final_score = (oi_score * 0.4) + (vol_score * 0.3) + (pa_score * 0.3)
+    # 4. BNO Gap Score
+    bno_score = 0.0
+    if bno and price:
+        gap = abs(price["pct"] - bno["pct"])
+        if gap > 0.50:
+            if bno["pct"] > price["pct"]: bno_score = 1.0  # BNO higher -> Crude will catch up
+            elif bno["pct"] < price["pct"]: bno_score = -1.0 # BNO lower -> Crude will drop
 
-    # Strict Decision
+    # Combine (OI 30%, Volume 20%, PA 30%, BNO 20%)
+    final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (bno_score * 0.2)
+
     decision = "NO TRADE"
     reason = "Indicators are mixed."
     
@@ -526,7 +542,7 @@ def compute_master_confluence(price, chain, ds):
 
     return {
         "decision": decision, "reason": reason, "final_score": final_score,
-        "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score
+        "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "bno_score": bno_score
     }
 
 # ==============================
@@ -553,6 +569,27 @@ with c1:
 with c2:
     st.markdown(f"""<div class="card"><div style="color:#666">Day Range</div>
       <div style="font-size:1.1rem">O {price['open'] or 0:,.2f}<br>H {price['high'] or 0:,.2f}<br>L {price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
+with c3:
+    st.markdown(f"""<div class="card"><div style="color:#666">Futures OI / Volume</div>
+      <div style="font-size:1.1rem">OI {price['oi'] if price['oi'] is not None else '—'}<br>
+      Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
+with c4:
+    if bno:
+        b_cls = "pos" if bno["chg"] > 0 else "neg" if bno["chg"] < 0 else ""
+        st.markdown(f"""<div class="card"><div style="color:#666">US Brent Oil (BNO)</div>
+          <div class="big">{bno['ltp']:,.2f}</div>
+          <div class="{b_cls}">{bno['chg']:+,.2f} ({bno['pct']:+.2f}%)</div></div>""", unsafe_allow_html=True)
+    else:
+        st.markdown(f"""<div class="card"><div style="color:#666">US Brent Oil (BNO)</div><div>Data unavailable</div></div>""", unsafe_allow_html=True)
+
+# BNO Gap Alert
+if bno and price:
+    gap_val = abs(price["pct"] - bno["pct"])
+    if gap_val > 0.50:
+        if bno["pct"] < price["pct"]:
+            st.error(f"🚨 **BNO GAP ALERT**: US BNO is **{bno['pct']:.2f}%** while CRUDEOILM is **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to drop to fill the gap.")
+        else:
+            st.success(f"🚨 **BNO GAP ALERT**: US BNO is **{bno['pct']:.2f}%** while CRUDEOILM is **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to rise to fill the gap.")
 
 if chain is None or chain.empty:
     st.error("Could not build the option chain (or Liquidity Filter removed all strikes).")
@@ -563,20 +600,10 @@ if chain is None or chain.empty:
     st.stop()
 
 sig = oi_signal(chain, spot)
-with c3:
-    kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
-    st.markdown(f"""<div class="pred {kls}"><div style="opacity:.8">Basic OI Signal</div>
-      <div style="font-size:1.6rem;font-weight:800">{sig['direction']}</div></div>""", unsafe_allow_html=True)
 
 # Compute Scores
 ds = compute_directional_score(chain, spot)
-master = compute_master_confluence(price, chain, ds)
-
-with c4:
-    mk = {"STRONG BUY": "bullish", "STRONG SELL": "bearish"}.get(master["decision"], "neutral")
-    if "WEAK" in master["decision"]: mk = "warning"
-    st.markdown(f"""<div class="pred {mk}"><div style="opacity:.8">Master Confluence</div>
-      <div style="font-size:1.6rem;font-weight:800">{master['decision']}</div></div>""", unsafe_allow_html=True)
+master = compute_master_confluence(price, chain, ds, bno)
 
 # ==============================
 # MASTER CONFLUENCE DASHBOARD
@@ -584,18 +611,42 @@ with c4:
 st.subheader("🔥 Master Confluence Dashboard")
 st.markdown(f"**{master['reason']}**")
 
-mc1, mc2, mc3, mc4 = st.columns(4)
+mc1, mc2, mc3, mc4, mc5 = st.columns(5)
 mc1.metric("OI Direction", f"{master['oi_score']:+.2f}", "Bullish" if master['oi_score']>0 else "Bearish", delta_color="normal")
-mc2.metric("Volume Flow (Put vs Call)", f"{master['vol_score']:+.2f}", "Put dominant" if master['vol_score']>0 else "Call dominant", delta_color="normal")
-mc3.metric("Price Action (vs Open/Prev)", f"{master['pa_score']:+.2f}", "Bullish" if master['pa_score']>0 else "Bearish", delta_color="normal")
-mc4.metric("Confluence Score", f"{master['final_score']:+.2f}")
+mc2.metric("Volume Flow", f"{master['vol_score']:+.2f}", "Put dominant" if master['vol_score']>0 else "Call dominant", delta_color="normal")
+mc3.metric("Price Action", f"{master['pa_score']:+.2f}", "Bullish" if master['pa_score']>0 else "Bearish", delta_color="normal")
+mc4.metric("BNO Correlation", f"{master['bno_score']:+.2f}", "Catch-up" if master['bno_score']!=0 else "Aligned", delta_color="normal")
+mc5.metric("Confluence Score", f"{master['final_score']:+.2f}")
 
 if master["decision"] in ("STRONG BUY", "STRONG SELL"):
-    st.success(f"✅ **{master['decision']}** — All 3 indicators (OI, Volume, Price Action) are aligned. High probability setup.")
+    st.success(f"✅ **{master['decision']}** — All indicators align perfectly. High probability setup.")
 elif master["decision"] in ("WEAK BUY", "WEAK SELL"):
-    st.warning(f"⚠️ **{master['decision']}** — Bias exists, but volume or price action is lagging. Trade with strict stop-loss.")
+    st.warning(f"⚠️ **{master['decision']}** — Bias exists, but not all indicators align. Trade with strict stop-loss.")
 else:
     st.info("⚪ **NO TRADE** — Indicators are conflicting. The market might be trapping OI writers. Wait for alignment.")
+
+# ==============================
+# OI CHARTS & TABLES (RESTORED)
+# ==============================
+st.subheader("Open Interest by Strike")
+st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
+st.subheader("Change in OI by Strike")
+st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
+
+def hl_top5(row):
+    return (["background-color:#ffd700;font-weight:bold;color:#000"] * len(row)) if row.name < 5 else [""] * len(row)
+
+oi_tbl = chain[["strike", "call_oi", "put_oi"]].copy()
+oi_tbl["HIGH OI"] = oi_tbl.apply(lambda r: "HIGH PUT" if r.put_oi > r.call_oi else "HIGH CALL", axis=1)
+oi_tbl["OI Difference"] = (oi_tbl["put_oi"] - oi_tbl["call_oi"]).abs()
+st.subheader("Open Interest Data (top by difference)")
+st.dataframe(oi_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1), use_container_width=True)
+
+chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg"]].copy()
+chg_tbl["HIGH OI"] = chg_tbl.apply(lambda r: "HIGH PUT" if r.put_chg > r.call_chg else "HIGH CALL", axis=1)
+chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
+st.subheader("Change in OI (top by difference)")
+st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1), use_container_width=True)
 
 # ==============================
 # DETAILED SCORE BREAKDOWN
@@ -622,7 +673,20 @@ if ds:
         """)
 
 # ==============================
-# OPTION CHAIN & SIGNALS
+# FUTURES OI FLOW (RESTORED)
+# ==============================
+flow = compute_crude_flow()
+if flow["rows"]:
+    st.subheader(f"CRUDEOILM Futures OI Flow — Macro Score: {flow['score']:.2f}")
+    st.markdown("**Weighted Macro Score (-1 to +1)**: Based on OI value change and price change across active CRUDEOILM futures.")
+    bias = "Bullish" if flow["score"] > 0 else ("Bearish" if flow["score"] < 0 else "Sideways")
+    st.write(f"Market Bias: {bias}")
+    st.dataframe(pd.DataFrame(flow["rows"]), use_container_width=True)
+else:
+    st.info("OI flow not available.")
+
+# ==============================
+# ENTRY / EXIT & OPTION CHAIN
 # ==============================
 st.subheader("📊 Entry/Exit Signal (OI Change)")
 entry, exit_ = entry_exit(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi)
