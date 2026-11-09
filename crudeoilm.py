@@ -22,12 +22,9 @@ now = dt.datetime.now(IST)
 today = now.date()
 
 # ==============================
-# TOKEN  (never hardcode it)
-# Put in .streamlit/secrets.toml:  UPSTOX_TOKEN = "eyJ0eXAi..."
-# or set env var UPSTOX_TOKEN, or paste in the sidebar.
+# TOKEN
 # ==============================
 DEFAULT_TOKEN = "Bearer eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIxMDM2NjciLCJqdGkiOiI2OWQyMzJlMWNjZDUyZDRjZDQzMzc5NjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc3NTM4MzI2NSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODA2OTYyNDAwfQ.VFRZ5NP87NM1Vyn4-bCB2FAvanu4wsueNHo_POQtPv8"
-
 
 def get_token():
     tok = None
@@ -51,6 +48,7 @@ st.markdown("""
 .bullish{background:linear-gradient(135deg,#11998e,#38ef7d)}
 .bearish{background:linear-gradient(135deg,#cb2d3e,#ef473a)}
 .neutral{background:linear-gradient(135deg,#2c3e50,#4ca1af)}
+.warning{background:linear-gradient(135deg,#f12711,#f5af19)}
 .entry{padding:14px 18px;border-radius:12px;margin-bottom:14px;border-left:6px solid}
 .pill{display:inline-block;padding:3px 12px;border-radius:20px;font-size:.8rem;font-weight:600;
       background:#e9ecef;color:#333;margin-right:6px}
@@ -70,19 +68,23 @@ with st.sidebar:
     delta_lo, delta_hi = st.slider("Delta band", 0.05, 0.95, (0.15, 0.75), 0.05)
     top_n = st.slider("Rows in OI tables", 5, 40, 20, 5)
     strike_window = st.slider("Strikes each side of price (for change in OI / Greeks)", 5, 40, 20, 5)
+    
+    st.markdown("---")
+    st.markdown("**Confluence Settings**")
+    min_liquidity = st.number_input("Min Option Liquidity (OI/Vol >)", 0, 10000, 500, 100)
+    
     st.markdown("**OI Flow score**")
     flow_big_cr = st.number_input("Big OI value change (₹ crore)", 1.0, 500.0, 10.0, 1.0)
     flow_pct = st.slider("OI % change threshold", 2, 50, 10, 1)
 
 TOKEN = get_token()
 if not TOKEN:
-    st.warning("Add your Upstox token (st.secrets, env var UPSTOX_TOKEN, or sidebar) to continue.")
+    st.warning("Add your Upstox token to continue.")
     st.stop()
 if not TOKEN.startswith("Bearer "):
     TOKEN = "Bearer " + TOKEN
 
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json", "Authorization": TOKEN}
-
 
 def api_get(path, params):
     r = requests.get("https://api.upstox.com" + path, params=params, headers=HEADERS, timeout=15)
@@ -91,13 +93,11 @@ def api_get(path, params):
     except Exception:
         return {"status": "error", "errors": [{"message": r.text[:300]}]}
 
-
 # ==============================
-# INSTRUMENT MASTER (MCX) -> futures + option expiries
+# INSTRUMENT MASTER
 # ==============================
 def ms_to_date(ms):
     return dt.datetime.fromtimestamp(ms / 1000, IST).date()
-
 
 @st.cache_data(ttl=6 * 3600)
 def load_crude_instruments():
@@ -120,7 +120,6 @@ def load_crude_instruments():
             })
     return keep
 
-
 try:
     ins = load_crude_instruments()
 except Exception as e:
@@ -130,28 +129,28 @@ except Exception as e:
 today_iso = today.isoformat()
 futs = sorted([i for i in ins if i["type"] == "FUT" and i["expiry"] >= today_iso], key=lambda x: x["expiry"])
 if not futs:
-    st.error("No active CRUDEOILM futures found in the instrument file.")
+    st.error("No active CRUDEOILM futures found.")
     st.stop()
 
 with st.sidebar:
     st.markdown("---")
-    fut_labels = {f"{f['symbol']}  (exp {f['expiry']})": f for f in futs}
-    fut = fut_labels[st.selectbox("Futures contract (price)", list(fut_labels.keys()), index=0)]
+    fut_labels = {f"{f['symbol']} (exp {f['expiry']})": f for f in futs}
+    fut = fut_labels[st.selectbox("Futures contract", list(fut_labels.keys()), index=0)]
 
     opt_expiries = sorted({i["expiry"] for i in ins
                            if i["type"] in ("CE", "PE")
                            and i["underlying_key"] == fut["key"]
                            and i["expiry"] >= today_iso})
     if opt_expiries:
-        opt_expiry = st.selectbox("Option expiry (OI / Greeks)", opt_expiries, index=0)
+        opt_expiry = st.selectbox("Option expiry", opt_expiries, index=0)
     else:
         opt_expiry = None
-        st.warning("No option expiries found for this futures contract.")
+        st.warning("No option expiries found.")
 
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE  (Upstox quote, TradingView fallback)
+# PRICE (PRICE ACTION)
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -165,6 +164,7 @@ def get_price():
         return {"ltp": last, "chg": chg, "pct": pct, "prev": prev,
                 "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"),
                 "oi": q.get("oi"), "volume": q.get("volume"), "src": "Upstox"}
+    # Fallback TV
     try:
         r = requests.post("https://scanner.tradingview.com/global/scan",
                           json={"symbols": {"tickers": ["MCX:CRUDEOILM1!"], "query": {"types": []}},
@@ -176,21 +176,16 @@ def get_price():
     except Exception:
         return None
 
-
 price = get_price()
 
 # ==============================
-# OPTION CHAIN -> OI, change OI, Greeks
-# 1) Upstox option-chain API
-# 2) Fallback (if empty): instrument master + quotes + greeks + previous-day OI
+# OPTION CHAIN (WITH VOLUME & LIQUIDITY)
 # ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-
 def _fetch_prev_oi(key, day_iso):
-    """(ok, OI at the last completed daily candle before day_iso)."""
     frm = (dt.date.fromisoformat(day_iso) - dt.timedelta(days=10)).isoformat()
     j = api_get(f"/v2/historical-candle/{quote(key, safe='')}/day/{day_iso}/{frm}", {})
     if j.get("status") != "success":
@@ -199,7 +194,6 @@ def _fetch_prev_oi(key, day_iso):
         if str(c[0])[:10] < day_iso and len(c) > 6 and c[6] is not None:
             return True, c[6]
     return True, None
-
 
 def chain_from_option_api():
     j = api_get("/v2/option/chain", {"instrument_key": FUT_KEY, "expiry_date": opt_expiry})
@@ -213,6 +207,7 @@ def chain_from_option_api():
             rows.append({
                 "strike": it["strike_price"],
                 "call_oi": c_oi, "put_oi": p_oi,
+                "call_vol": cm.get("volume") or 0, "put_vol": pm.get("volume") or 0,
                 "call_chg": c_oi - (cm.get("prev_oi") or 0), "put_chg": p_oi - (pm.get("prev_oi") or 0),
                 "call_ltp": cm.get("ltp"), "put_ltp": pm.get("ltp"),
                 "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
@@ -226,27 +221,24 @@ def chain_from_option_api():
         df = None
     return df, json.dumps(j)[:500]
 
-
 def chain_from_instruments(spot):
     opts = [i for i in ins if i["type"] in ("CE", "PE") and i["underlying_key"] == FUT_KEY
             and i["expiry"] == opt_expiry and i.get("strike") is not None]
     if not opts:
-        return None, "No CE/PE instruments with strike found for this expiry in the instrument file"
+        return None, "No CE/PE instruments found."
     by_strike = {}
     for o in opts:
         by_strike.setdefault(float(o["strike"]), {})[o["type"]] = o["key"]
     strikes = sorted(by_strike)
 
-    # OI + LTP for every strike (bulk quotes)
     quotes = {}
     for ch in _chunks([o["key"] for o in opts], 300):
         j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(ch)})
         if j.get("status") != "success":
-            return None, "quotes error: " + json.dumps(j)[:400]
+            return None, "quotes error"
         for v in (j.get("data") or {}).values():
             quotes[v.get("instrument_token")] = v
 
-    # window of strikes around price for Greeks + change in OI
     mid = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot)) if spot else len(strikes) // 2
     win = strikes[max(0, mid - strike_window): mid + strike_window + 1]
     wkeys = [k for s_ in win for k in by_strike[s_].values()]
@@ -276,6 +268,7 @@ def chain_from_instruments(spot):
         rows.append({
             "strike": s_,
             "call_oi": c_oi, "put_oi": p_oi,
+            "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0,
             "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
             "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
             "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0,
@@ -286,9 +279,8 @@ def chain_from_instruments(spot):
         })
     df = pd.DataFrame(rows).reset_index(drop=True)
     if (df["call_oi"].sum() + df["put_oi"].sum()) == 0:
-        return None, f"Quotes returned zero OI for all {len(opts)} option contracts"
+        return None, "Quotes returned zero OI"
     return df, None
-
 
 def get_chain():
     if not opt_expiry:
@@ -297,21 +289,28 @@ def get_chain():
     if df is not None:
         return df, None, "Upstox option-chain API", raw
     df, err = chain_from_instruments(price["ltp"] if price else 0)
-    return df, err, "Instrument master + quotes + prev-day OI", raw
-
+    return df, err, "Instrument master", raw
 
 chain, chain_err, chain_src, chain_raw = get_chain()
 
+# ==============================
+# LIQUIDITY FILTER
+# ==============================
+if chain is not None:
+    # Filter out illiquid strikes where both OI and Volume are extremely low
+    chain = chain[
+        ((chain["call_oi"] > min_liquidity) | (chain["put_oi"] > min_liquidity)) &
+        ((chain["call_vol"] > min_liquidity) | (chain["put_vol"] > min_liquidity))
+    ].reset_index(drop=True)
 
 # ==============================
-# CRUDEOILM OI FLOW – macro score (-1 to +1) across active futures contracts
-# Same scoring idea as the Nifty flow: OI value change + price move, weighted by OI value.
+# OI FLOW MACRO SCORE
 # ==============================
 def compute_crude_flow():
     keys = [f["key"] for f in futs]
     j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(keys)})
     if j.get("status") != "success":
-        return {"score": 0.0, "rows": [], "err": json.dumps(j)[:300]}
+        return {"score": 0.0, "rows": [], "err": "API Error"}
     q = {v.get("instrument_token"): v for v in (j.get("data") or {}).values()}
 
     cache = st.session_state.setdefault("prev_oi", {})
@@ -321,39 +320,29 @@ def compute_crude_flow():
             if ok:
                 cache[(k, today_iso)] = v
 
-    big = flow_big_cr * 1e7          # crore -> rupees
+    big = flow_big_cr * 1e7
     rows, wsum, wtot = [], 0.0, 0.0
     for f in futs:
         v = q.get(f["key"]) or {}
         last, chg, oi = v.get("last_price") or 0, v.get("net_change") or 0, v.get("oi") or 0
         prev_oi = cache.get((f["key"], today_iso))
-        if not last or prev_oi is None:
-            continue
+        if not last or prev_oi is None: continue
         lot = float(f.get("lot_size") or 10)
         prev_px = last - chg
         price_pct = chg / prev_px * 100 if prev_px else 0
         cur_val = oi * lot * last
         chg_abs = (oi - prev_oi) * lot * last
         oi_pct = (oi - prev_oi) / prev_oi * 100 if prev_oi else 0
-        if cur_val < 100_000_000:    # ignore tiny contracts
-            continue
+        if cur_val < 100_000_000: continue
 
         score = 0.0
-        if chg_abs > big and price_pct < -0.3:
-            score = -0.9
-        elif chg_abs > big and price_pct > 0.3:
-            score = 0.9
-        elif oi_pct > flow_pct * 3 and price_pct < -0.3:
-            score = -0.6
-        elif oi_pct > flow_pct and price_pct < -0.5:
-            score = -0.4
-        elif oi_pct > flow_pct and price_pct > 0.5:
-            score = 0.4
+        if chg_abs > big and price_pct < -0.3: score = -0.9
+        elif chg_abs > big and price_pct > 0.3: score = 0.9
+        elif oi_pct > flow_pct * 3 and price_pct < -0.3: score = -0.6
+        elif oi_pct > flow_pct and price_pct < -0.5: score = -0.4
+        elif oi_pct > flow_pct and price_pct > 0.5: score = 0.4
 
-        if oi_pct >= 0:
-            label = "Long Buildup" if price_pct >= 0 else "Short Buildup"
-        else:
-            label = "Short Covering" if price_pct >= 0 else "Long Unwinding"
+        label = "Long Buildup" if price_pct >= 0 else "Short Buildup" if oi_pct >= 0 else "Long Unwinding" if price_pct < 0 else "Short Covering"
 
         weight = cur_val / 1e9
         wsum += score * weight
@@ -366,17 +355,68 @@ def compute_crude_flow():
     return {"score": final, "rows": rows, "err": None}
 
 # ==============================
-# ANALYTICS
+# ANALYTICS & SCORES
 # ==============================
 def max_pain(df):
     best, low = None, float("inf")
     for s in df["strike"]:
         pain = ((s - df["strike"]).clip(lower=0) * df["call_oi"]).sum() + \
                ((df["strike"] - s).clip(lower=0) * df["put_oi"]).sum()
-        if pain < low:
-            best, low = s, pain
+        if pain < low: best, low = s, pain
     return best
 
+def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
+    d = chain[chain["has_chg"]].copy()
+    if d.empty or len(d) < 3: return None
+    strikes = sorted(d["strike"].unique())
+    atm = min(strikes, key=lambda s: abs(s - spot))
+    atm_idx = strikes.index(atm)
+
+    def get_row(s): return d[d["strike"] == s].iloc[0]
+
+    d["pc_diff"] = d["put_chg"].astype(float) - d["call_chg"].astype(float)
+    d["abs_diff"] = d["pc_diff"].abs()
+
+    top = d.nlargest(top_n_strikes, "abs_diff")
+    top_raw = (float((top["pc_diff"] * top["abs_diff"]).sum() / top["abs_diff"].sum()) if top["abs_diff"].sum() > 0 else 0.0)
+
+    r = get_row(atm)
+    atm_raw = float(r["put_chg"]) - float(r["call_chg"])
+
+    up_strike = strikes[atm_idx + 1] if atm_idx + 1 < len(strikes) else None
+    up_raw = (float(get_row(up_strike)["put_chg"]) - float(get_row(up_strike)["call_chg"])) if up_strike is not None else 0.0
+
+    down_strike = strikes[atm_idx - 1] if atm_idx - 1 >= 0 else None
+    down_raw = (float(get_row(down_strike)["put_chg"]) - float(get_row(down_strike)["call_chg"])) if down_strike is not None else 0.0
+
+    itm_call_strikes = [s for s in strikes if s < spot][-itm_count:]
+    itm_put_strikes  = [s for s in strikes if s > spot][:itm_count]
+    itm_call_avg = (sum(float(get_row(s)["call_chg"]) for s in itm_call_strikes) / len(itm_call_strikes)) if itm_call_strikes else 0.0
+    itm_put_avg  = (sum(float(get_row(s)["put_chg"]) for s in itm_put_strikes) / len(itm_put_strikes)) if itm_put_strikes else 0.0
+    itm_raw = itm_put_avg - itm_call_avg
+
+    scale = max(float(d["call_chg"].abs().max()), float(d["put_chg"].abs().max()), 1.0)
+    def clip(x): return max(-1.0, min(1.0, x))
+
+    norm = {
+        "Top ΔOI diff": clip(top_raw / scale),
+        "ATM": clip(atm_raw / scale),
+        "1↑ OTM (call)": clip(up_raw / scale),
+        "1↓ OTM (put)": clip(down_raw / scale),
+        "ITM": clip(itm_raw / scale),
+    }
+    weights = {"Top ΔOI diff": 0.30, "ATM": 0.20, "1↑ OTM (call)": 0.15, "1↓ OTM (put)": 0.15, "ITM": 0.20}
+    final = clip(sum(norm[k] * weights[k] for k in norm))
+
+    return {
+        "final": final, "pct": round(final * 100, 1),
+        "atm": atm, "up_strike": up_strike, "down_strike": down_strike,
+        "itm_call_strikes": itm_call_strikes, "itm_put_strikes": itm_put_strikes,
+        "norm": norm, "weights": weights,
+        "raw": {"Top ΔOI diff": top_raw, "ATM": atm_raw, "1↑ OTM (call)": up_raw, "1↓ OTM (put)": down_raw, "ITM": itm_raw},
+        "top_table": top[["strike", "call_chg", "put_chg", "pc_diff"]].reset_index(drop=True),
+        "chain": d,
+    }
 
 def oi_signal(df, spot):
     tc, tp = df["call_oi"].sum(), df["put_oi"].sum()
@@ -389,394 +429,211 @@ def oi_signal(df, spot):
     bull = bear = 0
     if spot > mp: bear += 1
     elif spot < mp: bull += 1
-    if pcr > 1.3: bull += 1          # put-heavy = support
+    if pcr > 1.3: bull += 1
     elif pcr < 0.7: bear += 1
     if spot > res: bull += 1
     elif spot < sup: bear += 1
     if net_p > net_c: bull += 1
     elif net_c > net_p: bear += 1
     direction = "BULLISH" if bull > bear else "BEARISH" if bear > bull else "NEUTRAL"
-    return dict(pcr=pcr, max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p,
-                bull=bull, bear=bear, direction=direction)
-
-
-def greeks_for(row, high_type):
-    side = "put" if high_type == "HIGH PUT" else "call"
-    return {k: row[f"{side}_{k}"] for k in ("delta", "gamma", "theta", "vega", "iv")}
-
+    return dict(pcr=pcr, max_pain=mp, resistance=res, support=sup, net_c=net_c, net_p=net_p, bull=bull, bear=bear, direction=direction)
 
 def entry_exit(df, spot, buffer, gap, lo, hi, max_candidates=5):
     d = df[df["has_chg"]].copy()
-    if d.empty:
-        return None, None
+    if d.empty: return None, None
     d["diff"] = (d["put_chg"] - d["call_chg"]).abs()
     d["type"] = d.apply(lambda r: "HIGH PUT" if r["put_chg"] > r["call_chg"] else "HIGH CALL", axis=1)
     d = d[d["diff"] > 0].sort_values("diff", ascending=False)
-    if d.empty:
-        return None, None
+    if d.empty: return None, None
 
-    def mk(row, kind):
+    def mk(row):
         strike = row["strike"]
         if row["type"] == "HIGH PUT":
-            trig, sig = strike + buffer, "BUY"
-            active = spot >= trig
-            why = f"Support at {strike:g} (Put ΔOI > Call ΔOI). Trigger {trig:g}"
+            trig, sig, active = strike + buffer, "BUY", spot >= strike + buffer
+            why = f"Support at {strike:g} (Put ΔOI > Call). Trigger {trig:g}"
         else:
-            trig, sig = strike - buffer, "SELL"
-            active = spot <= trig
-            why = f"Resistance at {strike:g} (Call ΔOI > Put ΔOI). Trigger {trig:g}"
-        g = greeks_for(row, row["type"])
+            trig, sig, active = strike - buffer, "SELL", spot <= strike - buffer
+            why = f"Resistance at {strike:g} (Call ΔOI > Put). Trigger {trig:g}"
+        side = "put" if row["type"] == "HIGH PUT" else "call"
+        g = {k: row[f"{side}_{k}"] for k in ("delta", "gamma", "theta", "vega", "iv")}
         return dict(strike=strike, type=row["type"], signal=sig, trigger=trig, active=active,
-                    reason=why, diff=row["diff"], greeks=g,
-                    delta_ok=(g["delta"] == 0) or (lo <= abs(g["delta"]) <= hi))
+                    reason=why, diff=row["diff"], greeks=g, delta_ok=(g["delta"] == 0) or (lo <= abs(g["delta"]) <= hi))
 
     cands = d.head(max_candidates)
     pick = None
     for _, r in cands.iterrows():
-        e = mk(r, "entry")
+        e = mk(r)
         if e["delta_ok"]:
-            pick = e
-            break
-        if pick is None:
-            pick = e          # fallback: top OI-diff strike
+            pick = e; break
+        if pick is None: pick = e
     entry = pick
-
     opp = "HIGH CALL" if entry["signal"] == "BUY" else "HIGH PUT"
     o = d[d["type"] == opp]
     exit_ = None
     if not o.empty:
-        ex = mk(o.iloc[0], "exit")
+        ex = mk(o.iloc[0])
         if abs(ex["trigger"] - entry["trigger"]) >= gap:
             exit_ = ex
-    if exit_ is None:
-        return None, None
+    if exit_ is None: return None, None
     return entry, exit_
 
+# ==============================
+# MASTER CONFLUENCE ENGINE
+# ==============================
+def compute_master_confluence(price, chain, ds):
+    # 1. OI Score (-1 to +1)
+    oi_score = ds["final"] if ds else 0.0
+    
+    # 2. Volume Score (-1 to +1) -> Put Vol vs Call Vol
+    tc_vol = chain["call_vol"].sum()
+    tp_vol = chain["put_vol"].sum()
+    tot_vol = tc_vol + tp_vol
+    vol_score = ((tp_vol - tc_vol) / tot_vol) if tot_vol > 0 else 0.0
+    
+    # 3. Price Action Score (-1 to +1)
+    pa_score = 0.0
+    if price:
+        ltp = price["ltp"]
+        open_px = price["open"] or ltp
+        prev_px = price["prev"] or ltp
+        if ltp > open_px and ltp > prev_px: pa_score = 1.0
+        elif ltp < open_px and ltp < prev_px: pa_score = -1.0
+        elif ltp > open_px: pa_score = 0.5
+        elif ltp < open_px: pa_score = -0.5
 
-def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
-    """Directional score from OI-change patterns around ATM.
-    Components: top ΔOI-diff strikes, ATM, 1-up OTM (call), 1-down OTM (put), ITM options.
-    Positive final = bullish (put writing), negative = bearish (call writing)."""
-    d = chain[chain["has_chg"]].copy()
-    if d.empty or len(d) < 3:
-        return None
+    # Combine
+    final_score = (oi_score * 0.4) + (vol_score * 0.3) + (pa_score * 0.3)
 
-    strikes = sorted(d["strike"].unique())
-    atm = min(strikes, key=lambda s: abs(s - spot))
-    atm_idx = strikes.index(atm)
-
-    def get_row(s):
-        return d[d["strike"] == s].iloc[0]
-
-    d["pc_diff"] = d["put_chg"].astype(float) - d["call_chg"].astype(float)
-    d["abs_diff"] = d["pc_diff"].abs()
-
-    # 1) Top ΔOI difference strikes (weighted by |diff|)
-    top = d.nlargest(top_n_strikes, "abs_diff")
-    top_raw = (float((top["pc_diff"] * top["abs_diff"]).sum() / top["abs_diff"].sum())
-               if top["abs_diff"].sum() > 0 else 0.0)
-
-    # 2) ATM
-    r = get_row(atm)
-    atm_raw = float(r["put_chg"]) - float(r["call_chg"])
-
-    # 3) 1-up strike (call is OTM here)
-    up_strike = strikes[atm_idx + 1] if atm_idx + 1 < len(strikes) else None
-    if up_strike is not None:
-        r = get_row(up_strike)
-        up_raw = float(r["put_chg"]) - float(r["call_chg"])
+    # Strict Decision
+    decision = "NO TRADE"
+    reason = "Indicators are mixed."
+    
+    if oi_score > 0.2 and vol_score > 0 and pa_score > 0:
+        decision = "STRONG BUY"
+        reason = "Bullish OI + Bullish Volume + Bullish Price Action align perfectly."
+    elif oi_score < -0.2 and vol_score < 0 and pa_score < 0:
+        decision = "STRONG SELL"
+        reason = "Bearish OI + Bearish Volume + Bearish Price Action align perfectly."
+    elif final_score > 0.3:
+        decision = "WEAK BUY"
+        reason = "Overall bias is positive, but not all indicators are perfectly aligned."
+    elif final_score < -0.3:
+        decision = "WEAK SELL"
+        reason = "Overall bias is negative, but not all indicators are perfectly aligned."
     else:
-        up_raw = 0.0
-
-    # 4) 1-down strike (put is OTM here)
-    down_strike = strikes[atm_idx - 1] if atm_idx - 1 >= 0 else None
-    if down_strike is not None:
-        r = get_row(down_strike)
-        down_raw = float(r["put_chg"]) - float(r["call_chg"])
-    else:
-        down_raw = 0.0
-
-    # 5) ITM (nearest N calls below spot + nearest N puts above spot)
-    itm_call_strikes = [s for s in strikes if s < spot][-itm_count:]
-    itm_put_strikes  = [s for s in strikes if s > spot][:itm_count]
-    itm_call_avg = (sum(float(get_row(s)["call_chg"]) for s in itm_call_strikes)
-                    / len(itm_call_strikes)) if itm_call_strikes else 0.0
-    itm_put_avg  = (sum(float(get_row(s)["put_chg"]) for s in itm_put_strikes)
-                    / len(itm_put_strikes)) if itm_put_strikes else 0.0
-    itm_raw = itm_put_avg - itm_call_avg
-
-    # Normalise per-strike ΔOI to [-1, 1]
-    scale = max(float(d["call_chg"].abs().max()),
-                float(d["put_chg"].abs().max()), 1.0)
-
-    def clip(x): return max(-1.0, min(1.0, x))
-
-    norm = {
-        "Top ΔOI diff":  clip(top_raw  / scale),
-        "ATM":           clip(atm_raw  / scale),
-        "1↑ OTM (call)": clip(up_raw   / scale),
-        "1↓ OTM (put)":  clip(down_raw / scale),
-        "ITM":           clip(itm_raw  / scale),
-    }
-    weights = {
-        "Top ΔOI diff":  0.30,
-        "ATM":           0.20,
-        "1↑ OTM (call)": 0.15,
-        "1↓ OTM (put)":  0.15,
-        "ITM":           0.20,
-    }
-
-    final = clip(sum(norm[k] * weights[k] for k in norm))
-
-    if abs(final) <= 0.15:
-        direction, strength = "NEUTRAL", "—"
-    elif final > 0:
-        direction = "BULLISH"
-        strength = "STRONG" if final > 0.5 else "MODERATE" if final > 0.3 else "WEAK"
-    else:
-        direction = "BEARISH"
-        strength = "STRONG" if final < -0.5 else "MODERATE" if final < -0.3 else "WEAK"
+        decision = "NEUTRAL"
+        reason = "Market is sideways or signals are conflicting. Wait for a clear breakout."
 
     return {
-        "final": final, "pct": round(final * 100, 1),
-        "direction": direction, "strength": strength,
-        "atm": atm, "up_strike": up_strike, "down_strike": down_strike,
-        "itm_call_strikes": itm_call_strikes, "itm_put_strikes": itm_put_strikes,
-        "norm": norm, "weights": weights,
-        "raw": {
-            "Top ΔOI diff": top_raw, "ATM": atm_raw,
-            "1↑ OTM (call)": up_raw, "1↓ OTM (put)": down_raw, "ITM": itm_raw,
-        },
-        "top_table": top[["strike", "call_chg", "put_chg", "pc_diff"]].reset_index(drop=True),
-        "chain": d,
+        "decision": decision, "reason": reason, "final_score": final_score,
+        "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score
     }
 
-
-def signal_box(title, s, spot, label):
-    emoji = "🟢" if s["signal"] == "BUY" else "🔴"
-    if s["active"]:
-        bg, fg = ("#2e7d32", "white") if s["signal"] == "BUY" else ("#c62828", "white")
-    else:
-        bg, fg = "#f9a825", "black"
-    status = "ACTIVE" if s["active"] else "PENDING (waiting for trigger)"
-    g = s["greeks"]
-    flt = "✅ passes delta filter" if s["delta_ok"] else "⚠️ outside delta band"
-    st.markdown(f"""
-    <div class="entry" style="background:{bg};color:{fg};border-left-color:{'#2e7d32' if s['signal']=='BUY' else '#c62828'}">
-      <span style="font-size:1.5rem;font-weight:800">{emoji} {label} {s['signal']} @ {s['trigger']:,.2f}</span>
-      <span class="pill" style="margin-left:10px">{s['type']}</span>
-      <span class="pill">{status}</span><br>
-      <span style="font-size:.9rem">Spot {spot:,.2f} | Key strike {s['strike']:g} | ΔOI diff {s['diff']:,.0f}<br>
-      📌 {s['reason']}<br>
-      Δ {g['delta']:.3f} · Γ {g['gamma']:.5f} · Θ {g['theta']:.2f} · V {g['vega']:.2f} · IV {g['iv']:.1f}% — {flt}</span>
-    </div>""", unsafe_allow_html=True)
-
-
 # ==============================
-# UI
+# UI RENDER
 # ==============================
 st.title("🛢️ CRUDEOILM Analytics — MCX")
 lot = fut.get("lot_size")
-st.markdown(
-    f'<span class="pill">Futures: {fut["symbol"]}</span>'
-    f'<span class="pill">Fut expiry: {fut["expiry"]}</span>'
-    f'<span class="pill">Option expiry: {opt_expiry or "—"}</span>'
-    f'<span class="pill">Lot: {lot if lot else "—"}</span>',
-    unsafe_allow_html=True)
+st.markdown(f'<span class="pill">Futures: {fut["symbol"]}</span><span class="pill">Exp: {fut["expiry"]}</span><span class="pill">Lot: {lot}</span>', unsafe_allow_html=True)
 
 if not price:
-    st.error("Could not fetch CRUDEOILM price.")
+    st.error("Could not fetch price.")
     st.stop()
 
 spot = price["ltp"]
+
+# Top Cards
+c1, c2, c3, c4 = st.columns(4)
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
-
-c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut) · {price['src']}</div>
+    st.markdown(f"""<div class="card"><div style="color:#666">CRUDEOILM (Fut)</div>
       <div class="big">{spot:,.2f}</div>
-      <div class="{cls}">{arrow} {price['chg']:+,.2f} ({price['pct']:+.2f}%)</div>
-      <div style="font-size:.8rem;color:#888">Prev: {price['prev']:,.2f}</div></div>""", unsafe_allow_html=True)
+      <div class="{cls}">{arrow} {price['chg']:+,.2f} ({price['pct']:+.2f}%)</div></div>""", unsafe_allow_html=True)
 with c2:
-    st.markdown(f"""<div class="card"><div style="color:#666">Day range</div>
-      <div style="font-size:1.1rem">O {price['open'] or 0:,.2f}<br>H {price['high'] or 0:,.2f}<br>L {price['low'] or 0:,.2f}</div></div>""",
-                unsafe_allow_html=True)
-with c3:
-    st.markdown(f"""<div class="card"><div style="color:#666">Futures OI / Volume</div>
-      <div style="font-size:1.1rem">OI {price['oi'] if price['oi'] is not None else '—'}<br>
-      Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="card"><div style="color:#666">Day Range</div>
+      <div style="font-size:1.1rem">O {price['open'] or 0:,.2f}<br>H {price['high'] or 0:,.2f}<br>L {price['low'] or 0:,.2f}</div></div>""", unsafe_allow_html=True)
 
 if chain is None or chain.empty:
-    st.error("Could not build the CRUDEOILM option chain.")
-    with st.expander("Debug details (send me this if it still fails)", expanded=True):
-        st.write("Futures key:", FUT_KEY, "| Option expiry:", opt_expiry)
-        st.write("Option-chain API raw response:")
+    st.error("Could not build the option chain (or Liquidity Filter removed all strikes).")
+    with st.expander("Debug details"):
+        st.write("Fut Key:", FUT_KEY, "| Expiry:", opt_expiry)
         st.code(chain_raw or "—")
-        st.write("Fallback result:")
         st.code(chain_err or "—")
     st.stop()
 
-st.caption(f"OI source: {chain_src} · expiry {opt_expiry}")
-if not chain["has_chg"].any():
-    st.warning("Change-in-OI is unavailable (previous-day OI not returned), so entry/exit signals are off.")
 sig = oi_signal(chain, spot)
-with c4:
+with c3:
     kls = {"BULLISH": "bullish", "BEARISH": "bearish"}.get(sig["direction"], "neutral")
-    st.markdown(f"""<div class="pred {kls}"><div style="opacity:.8">OI Signal</div>
-      <div style="font-size:1.6rem;font-weight:800">{sig['direction']}</div>
-      <div style="font-size:.85rem">🟢 {sig['bull']} vs 🔴 {sig['bear']}</div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="pred {kls}"><div style="opacity:.8">Basic OI Signal</div>
+      <div style="font-size:1.6rem;font-weight:800">{sig['direction']}</div></div>""", unsafe_allow_html=True)
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("PCR", f"{sig['pcr']:.2f}")
-m2.metric("Max Pain", f"{sig['max_pain']:,.0f}")
-m3.metric("Support (max Put OI)", f"{sig['support']:,.0f}")
-m4.metric("Resistance (max Call OI)", f"{sig['resistance']:,.0f}")
-m5.metric("Net ΔOI  Calls / Puts", f"{sig['net_c']:+,.0f} / {sig['net_p']:+,.0f}")
-
-# ---- Entry / Exit ----
-st.subheader("📊 OI Change Entry Signal")
-entry, exit_ = entry_exit(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi)
-if entry:
-    signal_box("Entry", entry, spot, "ENTRY")
-    st.subheader("📊 OI Change Exit Signal")
-    signal_box("Exit", exit_, spot, "EXIT")
-else:
-    st.info("ℹ️ No entry/exit signal (no OI change, or entry–exit gap below the minimum).")
-
-# ---- OI chart ----
-st.subheader("Open Interest by Strike")
-st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
-st.subheader("Change in OI by Strike")
-st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
-
-# ---- Tables ----
-def hl_top5(row):
-    return (["background-color:#ffd700;font-weight:bold;color:#000"] * len(row)) if row.name < 5 else [""] * len(row)
-
-oi_tbl = chain[["strike", "call_oi", "put_oi"]].copy()
-oi_tbl["HIGH OI"] = oi_tbl.apply(lambda r: "HIGH PUT" if r.put_oi > r.call_oi else "HIGH CALL", axis=1)
-oi_tbl["OI Difference"] = (oi_tbl["put_oi"] - oi_tbl["call_oi"]).abs()
-st.subheader("Open Interest Data (top by difference)")
-st.dataframe(oi_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True)
-             .style.apply(hl_top5, axis=1))
-
-chg_tbl = chain.loc[chain["has_chg"], ["strike", "call_chg", "put_chg"]].copy()
-chg_tbl["HIGH OI"] = chg_tbl.apply(lambda r: "HIGH PUT" if r.put_chg > r.call_chg else "HIGH CALL", axis=1)
-chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
-st.subheader("Change in OI (top by difference)")
-st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True)
-             .style.apply(hl_top5, axis=1))
-
-# ---- Directional Score (OI change patterns) ----
-st.subheader("🎯 Directional Score — OI Change Patterns")
+# Compute Scores
 ds = compute_directional_score(chain, spot)
+master = compute_master_confluence(price, chain, ds)
 
+with c4:
+    mk = {"STRONG BUY": "bullish", "STRONG SELL": "bearish"}.get(master["decision"], "neutral")
+    if "WEAK" in master["decision"]: mk = "warning"
+    st.markdown(f"""<div class="pred {mk}"><div style="opacity:.8">Master Confluence</div>
+      <div style="font-size:1.6rem;font-weight:800">{master['decision']}</div></div>""", unsafe_allow_html=True)
+
+# ==============================
+# MASTER CONFLUENCE DASHBOARD
+# ==============================
+st.subheader("🔥 Master Confluence Dashboard")
+st.markdown(f"**{master['reason']}**")
+
+mc1, mc2, mc3, mc4 = st.columns(4)
+mc1.metric("OI Direction", f"{master['oi_score']:+.2f}", "Bullish" if master['oi_score']>0 else "Bearish", delta_color="normal")
+mc2.metric("Volume Flow (Put vs Call)", f"{master['vol_score']:+.2f}", "Put dominant" if master['vol_score']>0 else "Call dominant", delta_color="normal")
+mc3.metric("Price Action (vs Open/Prev)", f"{master['pa_score']:+.2f}", "Bullish" if master['pa_score']>0 else "Bearish", delta_color="normal")
+mc4.metric("Confluence Score", f"{master['final_score']:+.2f}")
+
+if master["decision"] in ("STRONG BUY", "STRONG SELL"):
+    st.success(f"✅ **{master['decision']}** — All 3 indicators (OI, Volume, Price Action) are aligned. High probability setup.")
+elif master["decision"] in ("WEAK BUY", "WEAK SELL"):
+    st.warning(f"⚠️ **{master['decision']}** — Bias exists, but volume or price action is lagging. Trade with strict stop-loss.")
+else:
+    st.info("⚪ **NO TRADE** — Indicators are conflicting. The market might be trapping OI writers. Wait for alignment.")
+
+# ==============================
+# DETAILED SCORE BREAKDOWN
+# ==============================
+st.subheader("🎯 Directional OI Score Breakdown")
 if ds:
-    cls_map   = {"BULLISH": "bullish", "BEARISH": "bearish", "NEUTRAL": "neutral"}
-    emoji_map = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
-
-    st.markdown(f"""
-    <div class="pred {cls_map[ds['direction']]}">
-      <div style="opacity:.85;font-size:.9rem">OI-Change Directional Score</div>
-      <div style="font-size:2.4rem;font-weight:800;margin:6px 0">
-        {emoji_map[ds['direction']]} {ds['direction']}
-        <span style="font-size:1.1rem;opacity:.9">({ds['strength']})</span>
-      </div>
-      <div style="font-size:1.15rem">Score: {ds['final']:+.2f}  ({ds['pct']:+.1f}%)</div>
-      <div style="font-size:.85rem;margin-top:8px">
-        ATM <b>{ds['atm']:g}</b> ·
-        1↑ OTM call <b>{ds['up_strike'] if ds['up_strike'] is not None else '—'}</b> ·
-        1↓ OTM put <b>{ds['down_strike'] if ds['down_strike'] is not None else '—'}</b>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
+    st.markdown(f"**OI Score:** {ds['final']:+.2f} (ATM {ds['atm']:g} | 1↑ OTM {ds['up_strike']} | 1↓ OTM {ds['down_strike']})")
+    
     col_a, col_b = st.columns([3, 2])
-
     with col_a:
-        st.markdown("**Score breakdown**")
         breakdown = pd.DataFrame([
-            {
-                "Component":     k,
-                "Raw ΔPut−ΔCall": round(ds["raw"][k], 0),
-                "Normalized":    round(ds["norm"][k], 2),
-                "Weight":        ds["weights"][k],
-                "Contribution":  round(ds["norm"][k] * ds["weights"][k], 3),
-            }
+            {"Component": k, "Raw ΔPut−ΔCall": round(ds["raw"][k], 0), 
+             "Normalized": round(ds["norm"][k], 2), "Weight": ds["weights"][k]}
             for k in ds["norm"]
         ])
-        st.dataframe(breakdown.reset_index(drop=True))
-
+        st.dataframe(breakdown, use_container_width=True)
     with col_b:
-        st.markdown("**How to read**")
         st.markdown("""
-- **Put ΔOI ↑** → put writing → 🟢 bullish (support)
-- **Call ΔOI ↑** → call writing → 🔴 bearish (resistance)
-- **ITM calls** (below spot) ΔOI ↑ → 🔴 bearish
-- **ITM puts** (above spot) ΔOI ↑ → 🟢 bullish
-- **1↑ OTM call** ΔOI ↑ → 🔴 resistance above
-- **1↓ OTM put** ΔOI ↑ → 🟢 support below
-- **Top ΔOI diff** = highest-conviction strikes
-""")
+        **How to read:**
+        - **Put ΔOI ↑** → Bullish
+        - **Call ΔOI ↑** → Bearish
+        - **ITM Call ΔOI ↑** → Bearish
+        - **ITM Put ΔOI ↑** → Bullish
+        """)
 
-    st.markdown("**Top ΔOI difference strikes (used in score)**")
-    tt = ds["top_table"].copy()
-    tt["Bias"] = tt["pc_diff"].apply(
-        lambda x: "🟢 Bullish (put writing)" if x > 0
-        else ("🔴 Bearish (call writing)" if x < 0 else "—")
-    )
-    tt = tt.rename(columns={
-        "strike": "Strike", "call_chg": "Call ΔOI",
-        "put_chg": "Put ΔOI", "pc_diff": "ΔPut − ΔCall"
-    })
-    st.dataframe(tt.reset_index(drop=True))
-
-    st.markdown("**ITM / 1-step OTM strike detail**")
-    rows = []
-    for s in ds["itm_call_strikes"]:
-        r = ds["chain"][ds["chain"]["strike"] == s].iloc[0]
-        rows.append({"Strike": s, "Class": "ITM Call (below spot)",
-                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
-                     "Bias": "🔴 Bearish" if r["call_chg"] > 0 else "🟢 Bullish"})
-    for s in ds["itm_put_strikes"]:
-        r = ds["chain"][ds["chain"]["strike"] == s].iloc[0]
-        rows.append({"Strike": s, "Class": "ITM Put (above spot)",
-                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
-                     "Bias": "🟢 Bullish" if r["put_chg"] > 0 else "🔴 Bearish"})
-    if ds["up_strike"] is not None:
-        r = ds["chain"][ds["chain"]["strike"] == ds["up_strike"]].iloc[0]
-        rows.append({"Strike": ds["up_strike"], "Class": "1↑ OTM Call",
-                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
-                     "Bias": "🔴 Bearish" if r["call_chg"] > 0 else "🟢 Bullish"})
-    if ds["down_strike"] is not None:
-        r = ds["chain"][ds["chain"]["strike"] == ds["down_strike"]].iloc[0]
-        rows.append({"Strike": ds["down_strike"], "Class": "1↓ OTM Put",
-                     "Call ΔOI": int(r["call_chg"]), "Put ΔOI": int(r["put_chg"]),
-                     "Bias": "🟢 Bullish" if r["put_chg"] > 0 else "🔴 Bearish"})
-    if rows:
-        st.dataframe(pd.DataFrame(rows).reset_index(drop=True))
-
+# ==============================
+# OPTION CHAIN & SIGNALS
+# ==============================
+st.subheader("📊 Entry/Exit Signal (OI Change)")
+entry, exit_ = entry_exit(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi)
+if entry:
+    st.markdown(f"**ENTRY ({entry['signal']}):** Strike {entry['strike']:g} | Trigger {entry['trigger']:.2f} | {entry['reason']}")
+    st.markdown(f"**EXIT ({exit_['signal']}):** Strike {exit_['strike']:g} | Trigger {exit_['trigger']:.2f} | {exit_['reason']}")
 else:
-    st.info("Directional score needs at least 3 strikes with change-in-OI data.")
+    st.info("No clear entry/exit signal from OI change.")
 
-# ---- OI Flow / Macro score ----
-flow = compute_crude_flow()
-if flow["rows"]:
-    st.subheader(f"CRUDEOILM OI Flow Details — Macro Score: {flow['score']:.2f}")
-    st.markdown("**Weighted Macro Score (-1 to +1)**: Based on OI value change and price change across active CRUDEOILM futures.")
-    bias = "Bullish" if flow["score"] > 0 else ("Bearish" if flow["score"] < 0 else "Sideways")
-    st.write(f"Market Bias: {bias}")
-    st.dataframe(pd.DataFrame(flow["rows"]))
-else:
-    st.info("OI flow not available (no futures contract met the OI-value threshold, or previous-day OI was not returned).")
-    if flow.get("err"):
-        st.code(flow["err"])
-
-# ---- Option chain with Greeks around spot ----
-st.subheader("Option Chain + Greeks (strikes nearest to price)")
+st.subheader("Option Chain + Volume (Nearest to Price)")
 near = chain.iloc[(chain["strike"] - spot).abs().argsort()[:15]].sort_values("strike")
-st.dataframe(near[["strike", "call_ltp", "call_oi", "call_delta", "call_gamma", "call_theta", "call_iv",
-                   "put_ltp", "put_oi", "put_delta", "put_gamma", "put_theta", "put_iv"]].reset_index(drop=True))
+st.dataframe(near[["strike", "call_ltp", "call_oi", "call_vol", "call_chg", "put_ltp", "put_oi", "put_vol", "put_chg"]].reset_index(drop=True), use_container_width=True)
 
-st.caption(f"Last refresh: {now.strftime('%Y-%m-%d %H:%M:%S IST')} · auto-refresh every 15s")
+st.caption(f"Last refresh: {now.strftime('%H:%M:%S IST')} · Auto-refresh every 15s")
