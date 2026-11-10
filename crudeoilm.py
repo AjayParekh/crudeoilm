@@ -168,13 +168,10 @@ def get_price():
 
 @st.cache_data(ttl=10)
 def get_macro_data():
-    # Robust User-Agent to bypass API blocking
     yahoo_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
     try:
-        # Use the modern v8 chart endpoint which is highly reliable
         r_wti = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/CL=F", headers=yahoo_headers, timeout=5)
         r_wti.raise_for_status()
         wti_meta = r_wti.json()['chart']['result'][0]['meta']
@@ -182,9 +179,7 @@ def get_macro_data():
         r_inr = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X", headers=yahoo_headers, timeout=5)
         r_inr.raise_for_status()
         inr_meta = r_inr.json()['chart']['result'][0]['meta']
-        
     except Exception:
-        # Fallback to query2 if query1 fails
         try:
             r_wti = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/CL=F", headers=yahoo_headers, timeout=5)
             r_wti.raise_for_status()
@@ -199,20 +194,15 @@ def get_macro_data():
     try:
         wti_ltp = wti_meta.get('regularMarketPrice', 0.0)
         wti_prev = wti_meta.get('chartPreviousClose', wti_ltp)
-        
         inr_ltp = inr_meta.get('regularMarketPrice', 1.0)
         inr_prev = inr_meta.get('chartPreviousClose', inr_ltp)
         
         wti_chg = wti_ltp - wti_prev
         wti_pct = (wti_chg / wti_prev * 100) if wti_prev else 0.0
-        
         inr_chg = inr_ltp - inr_prev
         inr_pct = (inr_chg / inr_prev * 100) if inr_prev else 0.0
         
-        # Calculate Currency-Adjusted Expected Change
         adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
-        
-        # Health check
         is_market_closed = (wti_pct == 0.0 and wti_chg == 0.0)
         
         return {
@@ -591,6 +581,10 @@ if not price:
 
 spot = price["ltp"]
 
+# Calculate Master FIRST so we can use it in the banner
+ds = compute_directional_score(chain, spot) if chain is not None else None
+master = compute_master_confluence(price, chain, ds, macro) if chain is not None else None
+
 c1, c2, c3, c4 = st.columns(4)
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
@@ -619,7 +613,10 @@ with c4:
     else:
         st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable (API Blocked)</div></div>""", unsafe_allow_html=True)
 
-if macro and price:
+# ==============================
+# SAFE GAP ALERT LOGIC (INTEGRATED WITH MASTER)
+# ==============================
+if macro and price and master:
     adjusted_wti_pct = macro["adjusted_wti_pct"]
     gap_val = abs(price["pct"] - adjusted_wti_pct)
     
@@ -629,32 +626,36 @@ if macro and price:
     st.markdown("---")
     
     if macro["is_market_closed"]:
-         st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused until the US session resumes.")
+         st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused.")
     elif gap_val > 0.50:
-        if adjusted_wti_pct < price["pct"]:
-            st.error(f"🚨 **GAP ALERT (Drop Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
-                     f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
-                     f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).")
+        # GAP RISE EXPECTED
+        if adjusted_wti_pct > price["pct"]:
+            if master["pa_score"] < 0 or master["final_score"] < -0.1:
+                st.error(f"🛑 **TRAP ALERT (Rise Expected, But Trend is Bearish)**: WTI is **{macro['wti_pct']:.2f}%**, MCX is **{price['pct']:.2f}%** (Gap: {gap_val:.2f}%).\n\n"
+                         f"**DO NOT BUY.** The overall trend is heavily bearish (Price Action is negative). The gap will likely close by WTI dropping further, not MCX rising. Wait for MCX to stabilize above its Open price.")
+            else:
+                st.success(f"🚨 **SAFE GAP ALERT (Rise Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                           f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
+                           f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).")
+        
+        # GAP DROP EXPECTED
         else:
-            st.success(f"🚨 **GAP ALERT (Rise Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
-                     f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
-                     f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).")
+            if master["pa_score"] > 0 or master["final_score"] > 0.1:
+                st.error(f"🛑 **TRAP ALERT (Drop Expected, But Trend is Bullish)**: WTI is **{macro['wti_pct']:.2f}%**, MCX is **{price['pct']:.2f}%** (Gap: {gap_val:.2f}%).\n\n"
+                         f"**DO NOT SELL.** The overall trend is strongly bullish. The gap will likely close by WTI rising further, not MCX dropping. Wait for MCX to stabilize below its Open price.")
+            else:
+                st.error(f"🚨 **SAFE GAP ALERT (Drop Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                         f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
+                         f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).")
     else:
         st.info(f"✅ WTI and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
     st.markdown("---")
 
 if chain is None or chain.empty:
     st.error("Could not build the option chain (or Liquidity Filter removed all strikes).")
-    with st.expander("Debug details"):
-        st.write("Fut Key:", FUT_KEY, "| Expiry:", opt_expiry)
-        st.code(chain_raw or "—")
-        st.code(chain_err or "—")
     st.stop()
 
 sig = oi_signal(chain, spot)
-
-ds = compute_directional_score(chain, spot)
-master = compute_master_confluence(price, chain, ds, macro)
 
 st.subheader("🔥 Master Confluence Dashboard")
 st.markdown(f"**{master['reason']}**")
