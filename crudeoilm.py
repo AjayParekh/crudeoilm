@@ -94,7 +94,7 @@ def api_get(path, params):
         return {"status": "error", "errors": [{"message": r.text[:300]}]}
 
 # ==============================
-# INSTRUMENT MASTER
+# INSTRUMENT MASTERS
 # ==============================
 def ms_to_date(ms):
     return dt.datetime.fromtimestamp(ms / 1000, IST).date()
@@ -120,10 +120,31 @@ def load_crude_instruments():
             })
     return keep
 
+@st.cache_data(ttl=6 * 3600)
+def load_global_instruments():
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/GLOBAL.json.gz"
+    try:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        allins = json.loads(gzip.decompress(r.content))
+        wti_key, inr_key = None, None
+        for i in allins:
+            sym = str(i.get("trading_symbol", "")).upper()
+            name = str(i.get("name", "")).upper()
+            if "CRUDEOIL" in sym or "WTI" in sym or "WTI" in name or "CL1!" in sym:
+                wti_key = i.get("instrument_key")
+            if "USDINR" in sym or "USD/INR" in sym:
+                inr_key = i.get("instrument_key")
+        return wti_key, inr_key
+    except Exception:
+        # Fallback to standard Upstox Global Indicator keys if download fails
+        return "GLOBAL_INDICATOR|CL1!", "GLOBAL_INDICATOR|USDINR"
+
 try:
     ins = load_crude_instruments()
+    WTI_KEY, INR_KEY = load_global_instruments()
 except Exception as e:
-    st.error(f"Could not load MCX instrument file: {e}")
+    st.error(f"Could not load instrument files: {e}")
     st.stop()
 
 today_iso = today.isoformat()
@@ -150,7 +171,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE & WTI CRUDE (USOIL) DATA
+# PRICE & MACRO (WTI) DATA
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -164,53 +185,48 @@ def get_price():
         return {"ltp": last, "chg": chg, "pct": pct, "prev": prev,
                 "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"),
                 "oi": q.get("oi"), "volume": q.get("volume"), "src": "Upstox"}
-    try:
-        r = requests.post("https://scanner.tradingview.com/global/scan",
-                          json={"symbols": {"tickers": ["MCX:CRUDEOILM1!"], "query": {"types": []}},
-                                "columns": ["close", "change", "change_abs", "open", "high", "low"]},
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        d = r.json()["data"][0]["d"]
-        return {"ltp": d[0], "chg": d[2], "pct": d[1], "prev": round(d[0] - d[2], 2),
-                "open": d[3], "high": d[4], "low": d[5], "oi": None, "volume": None, "src": "TradingView"}
-    except Exception:
-        return None
+    return None
 
-@st.cache_data(ttl=10)  # Low TTL so USOIL updates quickly
+@st.cache_data(ttl=10)
 def get_macro_data():
-    try:
-        t = int(dt.datetime.now().timestamp()) # Cache buster
-        # Switched to TVC:USOIL (WTI Crude) instead of AMEX:BNO (Brent ETF)
-        r = requests.post(f"https://scanner.tradingview.com/global/scan?t={t}",
-                          json={"symbols": {"tickers": ["TVC:USOIL", "FX_IDC:USDINR"], "query": {"types": []}},
-                                "columns": ["close", "change", "change_abs"]},
-                          headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        data = r.json()["data"]
-        
-        # Handle case where TVC:USOIL API glitches and returns none
-        if not data or not data[0] or "d" not in data[0]:
-            return None
-            
-        wti_d = data[0]["d"]
-        inr_d = data[1]["d"]
-        
-        wti_pct = wti_d[1]
-        inr_pct = inr_d[1]
-        
-        # If WTI is exactly 0.00, the US market might be closed. We still calculate, but note it.
-        is_market_closed = (wti_pct == 0.0 and wti_d[2] == 0.0)
-        
-        # Calculate Currency-Adjusted WTI % Change
-        adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
-        
-        return {
-            "wti_ltp": wti_d[0], "wti_pct": wti_pct, "wti_chg": wti_d[2],
-            "inr_ltp": inr_d[0], "inr_pct": inr_pct, "inr_chg": inr_d[2],
-            "adjusted_wti_pct": adjusted_wti_pct,
-            "is_market_closed": is_market_closed,
-            "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
-        }
-    except Exception:
+    if not WTI_KEY or not INR_KEY:
         return None
+    
+    j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{WTI_KEY},{INR_KEY}"})
+    if j.get("status") != "success" or not j.get("data"):
+        return None
+        
+    data = j["data"]
+    wti_quote = data.get(WTI_KEY) or next((v for k, v in data.items() if "WTI" in k.upper() or "CRUDEOIL" in k.upper() or "CL" in k.upper()), None)
+    inr_quote = data.get(INR_KEY) or next((v for k, v in data.items() if "INR" in k.upper()), None)
+    
+    if not wti_quote or not inr_quote:
+        return None
+        
+    wti_ltp = wti_quote.get("last_price", 0)
+    wti_chg = wti_quote.get("net_change", 0)
+    inr_ltp = inr_quote.get("last_price", 1)
+    inr_chg = inr_quote.get("net_change", 0)
+    
+    wti_prev = wti_ltp - wti_chg
+    wti_pct = (wti_chg / wti_prev * 100) if wti_prev else 0.0
+    
+    inr_prev = inr_ltp - inr_chg
+    inr_pct = (inr_chg / inr_prev * 100) if inr_prev else 0.0
+    
+    # Calculate Currency-Adjusted Expected Change
+    adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
+    
+    # Health check (if no change, market is likely flat/closed)
+    is_market_closed = (wti_pct == 0.0 and wti_chg == 0.0)
+    
+    return {
+        "wti_ltp": wti_ltp, "wti_pct": wti_pct, "wti_chg": wti_chg,
+        "inr_ltp": inr_ltp, "inr_pct": inr_pct, "inr_chg": inr_chg,
+        "adjusted_wti_pct": adjusted_wti_pct,
+        "is_market_closed": is_market_closed,
+        "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
+    }
 
 price = get_price()
 macro = get_macro_data()
@@ -532,15 +548,15 @@ def compute_master_confluence(price, chain, ds, macro):
         elif ltp > open_px: pa_score = 0.5
         elif ltp < open_px: pa_score = -0.5
 
-    bno_score = 0.0
-    if macro and price and not macro["is_market_closed"]: # Only calculate gap if US market has real moves
+    wti_score = 0.0
+    if macro and price and not macro["is_market_closed"]:
         adjusted_wti_pct = macro["adjusted_wti_pct"]
         gap = abs(price["pct"] - adjusted_wti_pct)
         if gap > 0.50:
-            if adjusted_wti_pct > price["pct"]: bno_score = 1.0
-            elif adjusted_wti_pct < price["pct"]: bno_score = -1.0
+            if adjusted_wti_pct > price["pct"]: wti_score = 1.0
+            elif adjusted_wti_pct < price["pct"]: wti_score = -1.0
 
-    final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (bno_score * 0.2)
+    final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (wti_score * 0.2)
 
     decision = "NO TRADE"
     reason = "Indicators are mixed."
@@ -563,7 +579,7 @@ def compute_master_confluence(price, chain, ds, macro):
 
     return {
         "decision": decision, "reason": reason, "final_score": final_score,
-        "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "bno_score": bno_score
+        "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "wti_score": wti_score
     }
 
 # ==============================
@@ -596,11 +612,11 @@ with c3:
       Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
 with c4:
     if macro:
-        b_cls = "pos" if macro["wti_chg"] > 0 else "neg" if macro["wti_chg"] < 0 else ""
+        w_cls = "pos" if macro["wti_chg"] > 0 else "neg" if macro["wti_chg"] < 0 else ""
         i_cls = "pos" if macro["inr_chg"] > 0 else "neg" if macro["inr_chg"] < 0 else ""
         st.markdown(f"""<div class="card"><div style="color:#666">US WTI & USD/INR <span style="font-size:0.7rem;float:right">Upd: {macro['last_update']}</span></div>
           <div style="font-size:1.1rem;display:flex;justify-content:space-between">
-            <span>WTI: <b class="{b_cls}">{macro['wti_pct']:+.2f}%</b></span>
+            <span>WTI: <b class="{w_cls}">{macro['wti_pct']:+.2f}%</b></span>
             <span>INR: <b class="{i_cls}">{macro['inr_pct']:+.2f}%</b></span>
           </div>
           <div style="font-size:.8rem;color:#888;margin-top:4px">Adj. Expected: {macro['adjusted_wti_pct']:+.2f}%</div>
@@ -658,7 +674,7 @@ mc1, mc2, mc3, mc4, mc5 = st.columns(5)
 mc1.metric("OI Direction", f"{master['oi_score']:+.2f}", "Bullish" if master['oi_score']>0 else "Bearish", delta_color="normal")
 mc2.metric("Volume Flow", f"{master['vol_score']:+.2f}", "Put dominant" if master['vol_score']>0 else "Call dominant", delta_color="normal")
 mc3.metric("Price Action", f"{master['pa_score']:+.2f}", "Bullish" if master['pa_score']>0 else "Bearish", delta_color="normal")
-mc4.metric("WTI Correlation", f"{master['bno_score']:+.2f}", "Catch-up" if master['bno_score']!=0 else "Aligned", delta_color="normal")
+mc4.metric("WTI Correlation", f"{master['wti_score']:+.2f}", "Catch-up" if master['wti_score']!=0 else "Aligned", delta_color="normal")
 mc5.metric("Confluence Score", f"{master['final_score']:+.2f}")
 
 if master["decision"] in ("STRONG BUY", "STRONG SELL"):
