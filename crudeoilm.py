@@ -150,7 +150,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE & MACRO (WTI) DATA
+# PRICE & MACRO (WTI) DATA (YAHOO FINANCE)
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -168,47 +168,52 @@ def get_price():
 
 @st.cache_data(ttl=10)
 def get_macro_data():
-    # Verified Upstox Global Indicator keys for WTI Crude Oil & USD/INR
-    wti_key = "GLOBAL_INDICATOR|CLUSD"
-    inr_key = "GLOBAL_INDICATOR|USDINR"
-    
-    j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{wti_key},{inr_key}"})
-    if j.get("status") != "success" or not j.get("data"):
-        # Fallback to Brent if WTI CLUSD key is temporarily unavailable
-        wti_key = "GLOBAL_INDICATOR|BZUSD"
-        j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{wti_key},{inr_key}"})
-        if j.get("status") != "success" or not j.get("data"):
-            return None
-        
-    data = j["data"]
-    wti_quote = data.get(wti_key) or next(iter(data.values()))
-    inr_quote = data.get(inr_key) or next((v for k, v in data.items() if "INR" in k.upper() or "USDINR" in k.upper()), None)
-    
-    if not wti_quote or not inr_quote:
-        return None
-        
-    wti_ltp = wti_quote.get("last_price", 0)
-    wti_chg = wti_quote.get("net_change", 0)
-    inr_ltp = inr_quote.get("last_price", 1)
-    inr_chg = inr_quote.get("net_change", 0)
-    
-    wti_prev = wti_ltp - wti_chg
-    wti_pct = (wti_chg / wti_prev * 100) if wti_prev else 0.0
-    
-    inr_prev = inr_ltp - inr_chg
-    inr_pct = (inr_chg / inr_prev * 100) if inr_prev else 0.0
-    
-    # Currency-Adjusted Expected % Change
-    adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
-    is_market_closed = (wti_pct == 0.0 and wti_chg == 0.0)
-    
-    return {
-        "wti_ltp": wti_ltp, "wti_pct": wti_pct, "wti_chg": wti_chg,
-        "inr_ltp": inr_ltp, "inr_pct": inr_pct, "inr_chg": inr_chg,
-        "adjusted_wti_pct": adjusted_wti_pct,
-        "is_market_closed": is_market_closed,
-        "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
+    # Using Yahoo Finance API for reliable WTI and USD/INR data
+    yahoo_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
+    
+    try:
+        # Fetch WTI Crude (CL=F) and USD/INR (USDINR=X)
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=CL=F,USDINR=X"
+        r = requests.get(url, headers=yahoo_headers, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("quoteResponse", {}).get("result", [])
+        
+        if len(data) < 2:
+            return None
+            
+        # Parse WTI Data
+        wti_data = next((d for d in data if d.get("symbol") == "CL=F"), None)
+        inr_data = next((d for d in data if d.get("symbol") == "USDINR=X"), None)
+        
+        if not wti_data or not inr_data:
+            return None
+
+        wti_ltp = wti_data.get("regularMarketPrice", 0)
+        wti_chg = wti_data.get("regularMarketChange", 0)
+        wti_pct = wti_data.get("regularMarketChangePercent", 0)
+        
+        inr_ltp = inr_data.get("regularMarketPrice", 1)
+        inr_chg = inr_data.get("regularMarketChange", 0)
+        inr_pct = inr_data.get("regularMarketChangePercent", 0)
+        
+        # Calculate Currency-Adjusted Expected Change
+        adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
+        
+        # Health check
+        is_market_closed = (wti_pct == 0.0 and wti_chg == 0.0)
+        
+        return {
+            "wti_ltp": wti_ltp, "wti_pct": wti_pct, "wti_chg": wti_chg,
+            "inr_ltp": inr_ltp, "inr_pct": inr_pct, "inr_chg": inr_chg,
+            "adjusted_wti_pct": adjusted_wti_pct,
+            "is_market_closed": is_market_closed,
+            "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
+        }
+    except Exception as e:
+        # If Yahoo fails, return a graceful error object so the UI doesn't break
+        return None
 
 price = get_price()
 macro = get_macro_data()
