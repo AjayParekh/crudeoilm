@@ -150,7 +150,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE, BNO & USD/INR DATA
+# PRICE & WTI CRUDE (USOIL) DATA
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -175,29 +175,38 @@ def get_price():
     except Exception:
         return None
 
-@st.cache_data(ttl=10)  # Lowered TTL to 10 seconds so BNO updates quickly
+@st.cache_data(ttl=10)  # Low TTL so USOIL updates quickly
 def get_macro_data():
     try:
         t = int(dt.datetime.now().timestamp()) # Cache buster
+        # Switched to TVC:USOIL (WTI Crude) instead of AMEX:BNO (Brent ETF)
         r = requests.post(f"https://scanner.tradingview.com/global/scan?t={t}",
-                          json={"symbols": {"tickers": ["AMEX:BNO", "FX_IDC:USDINR"], "query": {"types": []}},
+                          json={"symbols": {"tickers": ["TVC:USOIL", "FX_IDC:USDINR"], "query": {"types": []}},
                                 "columns": ["close", "change", "change_abs"]},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         data = r.json()["data"]
         
-        bno_d = data[0]["d"]
+        # Handle case where TVC:USOIL API glitches and returns none
+        if not data or not data[0] or "d" not in data[0]:
+            return None
+            
+        wti_d = data[0]["d"]
         inr_d = data[1]["d"]
         
-        bno_pct = bno_d[1]
+        wti_pct = wti_d[1]
         inr_pct = inr_d[1]
         
-        # Calculate Currency-Adjusted BNO % Change
-        adjusted_bno_pct = (((1 + bno_pct/100) * (1 + inr_pct/100)) - 1) * 100
+        # If WTI is exactly 0.00, the US market might be closed. We still calculate, but note it.
+        is_market_closed = (wti_pct == 0.0 and wti_d[2] == 0.0)
+        
+        # Calculate Currency-Adjusted WTI % Change
+        adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
         
         return {
-            "bno_ltp": bno_d[0], "bno_pct": bno_pct, "bno_chg": bno_d[2],
+            "wti_ltp": wti_d[0], "wti_pct": wti_pct, "wti_chg": wti_d[2],
             "inr_ltp": inr_d[0], "inr_pct": inr_pct, "inr_chg": inr_d[2],
-            "adjusted_bno_pct": adjusted_bno_pct,
+            "adjusted_wti_pct": adjusted_wti_pct,
+            "is_market_closed": is_market_closed,
             "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
         }
     except Exception:
@@ -524,12 +533,12 @@ def compute_master_confluence(price, chain, ds, macro):
         elif ltp < open_px: pa_score = -0.5
 
     bno_score = 0.0
-    if macro and price:
-        adjusted_bno_pct = macro["adjusted_bno_pct"]
-        gap = abs(price["pct"] - adjusted_bno_pct)
+    if macro and price and not macro["is_market_closed"]: # Only calculate gap if US market has real moves
+        adjusted_wti_pct = macro["adjusted_wti_pct"]
+        gap = abs(price["pct"] - adjusted_wti_pct)
         if gap > 0.50:
-            if adjusted_bno_pct > price["pct"]: bno_score = 1.0
-            elif adjusted_bno_pct < price["pct"]: bno_score = -1.0
+            if adjusted_wti_pct > price["pct"]: bno_score = 1.0
+            elif adjusted_wti_pct < price["pct"]: bno_score = -1.0
 
     final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (bno_score * 0.2)
 
@@ -587,39 +596,42 @@ with c3:
       Vol {price['volume'] if price['volume'] is not None else '—'}</div></div>""", unsafe_allow_html=True)
 with c4:
     if macro:
-        b_cls = "pos" if macro["bno_chg"] > 0 else "neg" if macro["bno_chg"] < 0 else ""
+        b_cls = "pos" if macro["wti_chg"] > 0 else "neg" if macro["wti_chg"] < 0 else ""
         i_cls = "pos" if macro["inr_chg"] > 0 else "neg" if macro["inr_chg"] < 0 else ""
-        st.markdown(f"""<div class="card"><div style="color:#666">US BNO & USD/INR <span style="font-size:0.7rem;float:right">Upd: {macro['last_update']}</span></div>
+        st.markdown(f"""<div class="card"><div style="color:#666">US WTI & USD/INR <span style="font-size:0.7rem;float:right">Upd: {macro['last_update']}</span></div>
           <div style="font-size:1.1rem;display:flex;justify-content:space-between">
-            <span>BNO: <b class="{b_cls}">{macro['bno_pct']:+.2f}%</b></span>
+            <span>WTI: <b class="{b_cls}">{macro['wti_pct']:+.2f}%</b></span>
             <span>INR: <b class="{i_cls}">{macro['inr_pct']:+.2f}%</b></span>
           </div>
-          <div style="font-size:.8rem;color:#888;margin-top:4px">Adj. Expected: {macro['adjusted_bno_pct']:+.2f}%</div>
+          <div style="font-size:.8rem;color:#888;margin-top:4px">Adj. Expected: {macro['adjusted_wti_pct']:+.2f}%</div>
           </div>""", unsafe_allow_html=True)
     else:
         st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable</div></div>""", unsafe_allow_html=True)
 
-# Currency Adjusted BNO Gap Alert
+# Currency Adjusted WTI Gap Alert
 if macro and price:
-    adjusted_bno_pct = macro["adjusted_bno_pct"]
-    gap_val = abs(price["pct"] - adjusted_bno_pct)
+    adjusted_wti_pct = macro["adjusted_wti_pct"]
+    gap_val = abs(price["pct"] - adjusted_wti_pct)
     
     # Calculate exact points gap
-    expected_price = price["prev"] * (1 + adjusted_bno_pct / 100)
+    expected_price = price["prev"] * (1 + adjusted_wti_pct / 100)
     gap_points = expected_price - spot
     
     st.markdown("---")
-    if gap_val > 0.50:
-        if adjusted_bno_pct < price["pct"]:
-            st.error(f"🚨 **GAP ALERT (Drop Expected)**: BNO is **{macro['bno_pct']:.2f}%**, Adjusted for INR is **{adjusted_bno_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+    
+    if macro["is_market_closed"]:
+         st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused until the US session resumes.")
+    elif gap_val > 0.50:
+        if adjusted_wti_pct < price["pct"]:
+            st.error(f"🚨 **GAP ALERT (Drop Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
                      f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
                      f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).")
         else:
-            st.success(f"🚨 **GAP ALERT (Rise Expected)**: BNO is **{macro['bno_pct']:.2f}%**, Adjusted for INR is **{adjusted_bno_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+            st.success(f"🚨 **GAP ALERT (Rise Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
                      f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
                      f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).")
     else:
-        st.info(f"✅ BNO and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
+        st.info(f"✅ WTI and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
     st.markdown("---")
 
 if chain is None or chain.empty:
@@ -646,7 +658,7 @@ mc1, mc2, mc3, mc4, mc5 = st.columns(5)
 mc1.metric("OI Direction", f"{master['oi_score']:+.2f}", "Bullish" if master['oi_score']>0 else "Bearish", delta_color="normal")
 mc2.metric("Volume Flow", f"{master['vol_score']:+.2f}", "Put dominant" if master['vol_score']>0 else "Call dominant", delta_color="normal")
 mc3.metric("Price Action", f"{master['pa_score']:+.2f}", "Bullish" if master['pa_score']>0 else "Bearish", delta_color="normal")
-mc4.metric("BNO Correlation", f"{master['bno_score']:+.2f}", "Catch-up" if master['bno_score']!=0 else "Aligned", delta_color="normal")
+mc4.metric("WTI Correlation", f"{master['bno_score']:+.2f}", "Catch-up" if master['bno_score']!=0 else "Aligned", delta_color="normal")
 mc5.metric("Confluence Score", f"{master['final_score']:+.2f}")
 
 if master["decision"] in ("STRONG BUY", "STRONG SELL"):
