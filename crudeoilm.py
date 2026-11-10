@@ -175,11 +175,11 @@ def get_price():
     except Exception:
         return None
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=10)  # Lowered TTL to 10 seconds so BNO updates quickly
 def get_macro_data():
     try:
-        # Fetch BNO (Brent Oil ETF) and USD/INR simultaneously
-        r = requests.post("https://scanner.tradingview.com/global/scan",
+        t = int(dt.datetime.now().timestamp()) # Cache buster
+        r = requests.post(f"https://scanner.tradingview.com/global/scan?t={t}",
                           json={"symbols": {"tickers": ["AMEX:BNO", "FX_IDC:USDINR"], "query": {"types": []}},
                                 "columns": ["close", "change", "change_abs"]},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
@@ -192,13 +192,13 @@ def get_macro_data():
         inr_pct = inr_d[1]
         
         # Calculate Currency-Adjusted BNO % Change
-        # Formula: ((1 + BNO%) * (1 + USDINR%)) - 1
         adjusted_bno_pct = (((1 + bno_pct/100) * (1 + inr_pct/100)) - 1) * 100
         
         return {
             "bno_ltp": bno_d[0], "bno_pct": bno_pct, "bno_chg": bno_d[2],
             "inr_ltp": inr_d[0], "inr_pct": inr_pct, "inr_chg": inr_d[2],
-            "adjusted_bno_pct": adjusted_bno_pct
+            "adjusted_bno_pct": adjusted_bno_pct,
+            "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
         }
     except Exception:
         return None
@@ -523,14 +523,13 @@ def compute_master_confluence(price, chain, ds, macro):
         elif ltp > open_px: pa_score = 0.5
         elif ltp < open_px: pa_score = -0.5
 
-    # Currency-Adjusted BNO Gap Score
     bno_score = 0.0
     if macro and price:
         adjusted_bno_pct = macro["adjusted_bno_pct"]
         gap = abs(price["pct"] - adjusted_bno_pct)
         if gap > 0.50:
-            if adjusted_bno_pct > price["pct"]: bno_score = 1.0  # Adjusted BNO higher -> MCX will rise
-            elif adjusted_bno_pct < price["pct"]: bno_score = -1.0 # Adjusted BNO lower -> MCX will drop
+            if adjusted_bno_pct > price["pct"]: bno_score = 1.0
+            elif adjusted_bno_pct < price["pct"]: bno_score = -1.0
 
     final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (bno_score * 0.2)
 
@@ -590,7 +589,7 @@ with c4:
     if macro:
         b_cls = "pos" if macro["bno_chg"] > 0 else "neg" if macro["bno_chg"] < 0 else ""
         i_cls = "pos" if macro["inr_chg"] > 0 else "neg" if macro["inr_chg"] < 0 else ""
-        st.markdown(f"""<div class="card"><div style="color:#666">US BNO & USD/INR</div>
+        st.markdown(f"""<div class="card"><div style="color:#666">US BNO & USD/INR <span style="font-size:0.7rem;float:right">Upd: {macro['last_update']}</span></div>
           <div style="font-size:1.1rem;display:flex;justify-content:space-between">
             <span>BNO: <b class="{b_cls}">{macro['bno_pct']:+.2f}%</b></span>
             <span>INR: <b class="{i_cls}">{macro['inr_pct']:+.2f}%</b></span>
@@ -605,12 +604,20 @@ if macro and price:
     adjusted_bno_pct = macro["adjusted_bno_pct"]
     gap_val = abs(price["pct"] - adjusted_bno_pct)
     
+    # Calculate exact points gap
+    expected_price = price["prev"] * (1 + adjusted_bno_pct / 100)
+    gap_points = expected_price - spot
+    
     st.markdown("---")
     if gap_val > 0.50:
         if adjusted_bno_pct < price["pct"]:
-            st.error(f"🚨 **CURRENCY-ADJUSTED GAP ALERT**: US BNO is **{macro['bno_pct']:.2f}%**, USD/INR is **{macro['inr_pct']:.2f}%** (Expected MCX: {adjusted_bno_pct:.2f}%). MCX is at **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to **drop** to fill the gap.")
+            st.error(f"🚨 **GAP ALERT (Drop Expected)**: BNO is **{macro['bno_pct']:.2f}%**, Adjusted for INR is **{adjusted_bno_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                     f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
+                     f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).")
         else:
-            st.success(f"🚨 **CURRENCY-ADJUSTED GAP ALERT**: US BNO is **{macro['bno_pct']:.2f}%**, USD/INR is **{macro['inr_pct']:.2f}%** (Expected MCX: {adjusted_bno_pct:.2f}%). MCX is at **{price['pct']:.2f}%**. Gap is {gap_val:.2f}%. Expect CRUDEOILM to **rise** to fill the gap.")
+            st.success(f"🚨 **GAP ALERT (Rise Expected)**: BNO is **{macro['bno_pct']:.2f}%**, Adjusted for INR is **{adjusted_bno_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                     f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
+                     f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).")
     else:
         st.info(f"✅ BNO and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
     st.markdown("---")
