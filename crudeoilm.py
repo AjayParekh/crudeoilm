@@ -150,7 +150,7 @@ with st.sidebar:
 FUT_KEY = fut["key"]
 
 # ==============================
-# PRICE & MACRO (WTI) DATA (YAHOO FINANCE)
+# PRICE & MACRO (WTI) DATA 
 # ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
@@ -168,35 +168,46 @@ def get_price():
 
 @st.cache_data(ttl=10)
 def get_macro_data():
-    # Using Yahoo Finance API for reliable WTI and USD/INR data
+    # Robust User-Agent to bypass API blocking
     yahoo_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
     try:
-        # Fetch WTI Crude (CL=F) and USD/INR (USDINR=X)
-        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=CL=F,USDINR=X"
-        r = requests.get(url, headers=yahoo_headers, timeout=10)
-        r.raise_for_status()
-        data = r.json().get("quoteResponse", {}).get("result", [])
+        # Use the modern v8 chart endpoint which is highly reliable
+        r_wti = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/CL=F", headers=yahoo_headers, timeout=5)
+        r_wti.raise_for_status()
+        wti_meta = r_wti.json()['chart']['result'][0]['meta']
         
-        if len(data) < 2:
-            return None
+        r_inr = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X", headers=yahoo_headers, timeout=5)
+        r_inr.raise_for_status()
+        inr_meta = r_inr.json()['chart']['result'][0]['meta']
+        
+    except Exception:
+        # Fallback to query2 if query1 fails
+        try:
+            r_wti = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/CL=F", headers=yahoo_headers, timeout=5)
+            r_wti.raise_for_status()
+            wti_meta = r_wti.json()['chart']['result'][0]['meta']
             
-        # Parse WTI Data
-        wti_data = next((d for d in data if d.get("symbol") == "CL=F"), None)
-        inr_data = next((d for d in data if d.get("symbol") == "USDINR=X"), None)
-        
-        if not wti_data or not inr_data:
+            r_inr = requests.get("https://query2.finance.yahoo.com/v8/finance/chart/USDINR=X", headers=yahoo_headers, timeout=5)
+            r_inr.raise_for_status()
+            inr_meta = r_inr.json()['chart']['result'][0]['meta']
+        except Exception:
             return None
 
-        wti_ltp = wti_data.get("regularMarketPrice", 0)
-        wti_chg = wti_data.get("regularMarketChange", 0)
-        wti_pct = wti_data.get("regularMarketChangePercent", 0)
+    try:
+        wti_ltp = wti_meta.get('regularMarketPrice', 0.0)
+        wti_prev = wti_meta.get('chartPreviousClose', wti_ltp)
         
-        inr_ltp = inr_data.get("regularMarketPrice", 1)
-        inr_chg = inr_data.get("regularMarketChange", 0)
-        inr_pct = inr_data.get("regularMarketChangePercent", 0)
+        inr_ltp = inr_meta.get('regularMarketPrice', 1.0)
+        inr_prev = inr_meta.get('chartPreviousClose', inr_ltp)
+        
+        wti_chg = wti_ltp - wti_prev
+        wti_pct = (wti_chg / wti_prev * 100) if wti_prev else 0.0
+        
+        inr_chg = inr_ltp - inr_prev
+        inr_pct = (inr_chg / inr_prev * 100) if inr_prev else 0.0
         
         # Calculate Currency-Adjusted Expected Change
         adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
@@ -211,8 +222,7 @@ def get_macro_data():
             "is_market_closed": is_market_closed,
             "last_update": dt.datetime.now(IST).strftime("%H:%M:%S")
         }
-    except Exception as e:
-        # If Yahoo fails, return a graceful error object so the UI doesn't break
+    except Exception:
         return None
 
 price = get_price()
@@ -607,7 +617,7 @@ with c4:
           <div style="font-size:.8rem;color:#888;margin-top:4px">Adj. Expected: {macro['adjusted_wti_pct']:+.2f}%</div>
           </div>""", unsafe_allow_html=True)
     else:
-        st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable (API Blocked)</div></div>""", unsafe_allow_html=True)
 
 if macro and price:
     adjusted_wti_pct = macro["adjusted_wti_pct"]
