@@ -120,31 +120,10 @@ def load_crude_instruments():
             })
     return keep
 
-@st.cache_data(ttl=6 * 3600)
-def load_global_instruments():
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/GLOBAL.json.gz"
-    try:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        allins = json.loads(gzip.decompress(r.content))
-        wti_key, inr_key = None, None
-        for i in allins:
-            sym = str(i.get("trading_symbol", "")).upper()
-            name = str(i.get("name", "")).upper()
-            if "CRUDEOIL" in sym or "WTI" in sym or "WTI" in name or "CL1!" in sym:
-                wti_key = i.get("instrument_key")
-            if "USDINR" in sym or "USD/INR" in sym:
-                inr_key = i.get("instrument_key")
-        return wti_key, inr_key
-    except Exception:
-        # Fallback to standard Upstox Global Indicator keys if download fails
-        return "GLOBAL_INDICATOR|CL1!", "GLOBAL_INDICATOR|USDINR"
-
 try:
     ins = load_crude_instruments()
-    WTI_KEY, INR_KEY = load_global_instruments()
 except Exception as e:
-    st.error(f"Could not load instrument files: {e}")
+    st.error(f"Could not load MCX instrument file: {e}")
     st.stop()
 
 today_iso = today.isoformat()
@@ -189,16 +168,21 @@ def get_price():
 
 @st.cache_data(ttl=10)
 def get_macro_data():
-    if not WTI_KEY or not INR_KEY:
-        return None
+    # Verified Upstox Global Indicator keys for WTI Crude Oil & USD/INR
+    wti_key = "GLOBAL_INDICATOR|CLUSD"
+    inr_key = "GLOBAL_INDICATOR|USDINR"
     
-    j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{WTI_KEY},{INR_KEY}"})
+    j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{wti_key},{inr_key}"})
     if j.get("status") != "success" or not j.get("data"):
-        return None
+        # Fallback to Brent if WTI CLUSD key is temporarily unavailable
+        wti_key = "GLOBAL_INDICATOR|BZUSD"
+        j = api_get("/v2/market-quote/quotes", {"instrument_key": f"{wti_key},{inr_key}"})
+        if j.get("status") != "success" or not j.get("data"):
+            return None
         
     data = j["data"]
-    wti_quote = data.get(WTI_KEY) or next((v for k, v in data.items() if "WTI" in k.upper() or "CRUDEOIL" in k.upper() or "CL" in k.upper()), None)
-    inr_quote = data.get(INR_KEY) or next((v for k, v in data.items() if "INR" in k.upper()), None)
+    wti_quote = data.get(wti_key) or next(iter(data.values()))
+    inr_quote = data.get(inr_key) or next((v for k, v in data.items() if "INR" in k.upper() or "USDINR" in k.upper()), None)
     
     if not wti_quote or not inr_quote:
         return None
@@ -214,10 +198,8 @@ def get_macro_data():
     inr_prev = inr_ltp - inr_chg
     inr_pct = (inr_chg / inr_prev * 100) if inr_prev else 0.0
     
-    # Calculate Currency-Adjusted Expected Change
+    # Currency-Adjusted Expected % Change
     adjusted_wti_pct = (((1 + wti_pct/100) * (1 + inr_pct/100)) - 1) * 100
-    
-    # Health check (if no change, market is likely flat/closed)
     is_market_closed = (wti_pct == 0.0 and wti_chg == 0.0)
     
     return {
@@ -346,7 +328,6 @@ def get_chain():
 
 chain, chain_err, chain_src, chain_raw = get_chain()
 
-# LIQUIDITY FILTER
 if chain is not None:
     chain = chain[
         ((chain["call_oi"] > min_liquidity) | (chain["put_oi"] > min_liquidity)) &
@@ -595,7 +576,6 @@ if not price:
 
 spot = price["ltp"]
 
-# Top Cards
 c1, c2, c3, c4 = st.columns(4)
 cls = "pos" if price["chg"] > 0 else "neg" if price["chg"] < 0 else ""
 arrow = "▲" if price["chg"] > 0 else "▼" if price["chg"] < 0 else "—"
@@ -624,12 +604,10 @@ with c4:
     else:
         st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable</div></div>""", unsafe_allow_html=True)
 
-# Currency Adjusted WTI Gap Alert
 if macro and price:
     adjusted_wti_pct = macro["adjusted_wti_pct"]
     gap_val = abs(price["pct"] - adjusted_wti_pct)
     
-    # Calculate exact points gap
     expected_price = price["prev"] * (1 + adjusted_wti_pct / 100)
     gap_points = expected_price - spot
     
@@ -660,13 +638,9 @@ if chain is None or chain.empty:
 
 sig = oi_signal(chain, spot)
 
-# Compute Scores
 ds = compute_directional_score(chain, spot)
 master = compute_master_confluence(price, chain, ds, macro)
 
-# ==============================
-# MASTER CONFLUENCE DASHBOARD
-# ==============================
 st.subheader("🔥 Master Confluence Dashboard")
 st.markdown(f"**{master['reason']}**")
 
@@ -684,9 +658,6 @@ elif master["decision"] in ("WEAK BUY", "WEAK SELL"):
 else:
     st.info("⚪ **NO TRADE** — Indicators are conflicting. The market might be trapping OI writers. Wait for alignment.")
 
-# ==============================
-# OI CHARTS & TABLES
-# ==============================
 st.subheader("Open Interest by Strike")
 st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
 st.subheader("Change in OI by Strike")
@@ -707,9 +678,6 @@ chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
 st.subheader("Change in OI (top by difference)")
 st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1), use_container_width=True)
 
-# ==============================
-# DETAILED SCORE BREAKDOWN
-# ==============================
 st.subheader("🎯 Directional OI Score Breakdown")
 if ds:
     st.markdown(f"**OI Score:** {ds['final']:+.2f} (ATM {ds['atm']:g} | 1↑ OTM {ds['up_strike']} | 1↓ OTM {ds['down_strike']})")
@@ -731,9 +699,6 @@ if ds:
         - **ITM Put ΔOI ↑** → Bullish
         """)
 
-# ==============================
-# FUTURES OI FLOW
-# ==============================
 flow = compute_crude_flow()
 if flow["rows"]:
     st.subheader(f"CRUDEOILM Futures OI Flow — Macro Score: {flow['score']:.2f}")
@@ -744,9 +709,6 @@ if flow["rows"]:
 else:
     st.info("OI flow not available.")
 
-# ==============================
-# ENTRY / EXIT & OPTION CHAIN
-# ==============================
 st.subheader("📊 Entry/Exit Signal (OI Change)")
 entry, exit_ = entry_exit(chain, spot, buffer_pts, min_gap, delta_lo, delta_hi)
 if entry:
