@@ -538,7 +538,7 @@ def compute_master_confluence(price, chain, ds, macro):
     if macro and price and not macro["is_market_closed"]:
         adjusted_wti_pct = macro["adjusted_wti_pct"]
         gap = abs(price["pct"] - adjusted_wti_pct)
-        if gap > 0.50:
+        if gap > 1.00:  # CHANGED FROM 0.50 to 1.00
             if adjusted_wti_pct > price["pct"]: wti_score = 1.0
             elif adjusted_wti_pct < price["pct"]: wti_score = -1.0
 
@@ -626,7 +626,7 @@ if macro and price and master:
     
     if macro["is_market_closed"]:
          st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused.")
-    elif gap_val > 0.50:
+    elif gap_val > 1.00:  # CHANGED FROM 0.50 to 1.00
         # GAP RISE EXPECTED
         if adjusted_wti_pct > price["pct"]:
             if master["pa_score"] < 0 or master["final_score"] < -0.1:
