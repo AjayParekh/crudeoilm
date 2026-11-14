@@ -626,7 +626,7 @@ if macro and price and master:
     
     if macro["is_market_closed"]:
          st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused.")
-    elif gap_val > 1.00:  # CHANGED FROM 0.50 to 1.00
+    elif gap_val > 1.00:
         # GAP RISE EXPECTED
         if adjusted_wti_pct > price["pct"]:
             if master["pa_score"] < 0 or master["final_score"] < -0.1:
@@ -634,10 +634,12 @@ if macro and price and master:
                          f"**DO NOT BUY YET.** The overall trend is heavily bearish (Price Action is negative). The gap will likely close by WTI dropping further, not MCX rising. Wait for MCX to stabilize above its Open price.")
             else:
                 sl_price = min(price['low'], spot - 20) if price['low'] else spot - 20
-                st.success(f"🚨 **SAFE GAP ALERT (Rise Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
-                           f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
-                           f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).\n"
-                           f"🛡️ **Safe Stop Loss:** ~**{sl_price:,.2f}** (Below Day Low). Give it room!")
+                alert_msg = (f"🚨 **SAFE GAP ALERT (Rise Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                             f"👉 **Trade Plan:** Expect MCX to rise to fill the gap.\n"
+                             f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Rise of ~{abs(gap_points):.0f} points).\n"
+                             f"🛡️ **Safe Stop Loss:** ~**{sl_price:,.2f}** (Below Day Low). Give it room!")
+                
+                st.success(alert_msg)
         
         # GAP DROP EXPECTED
         else:
@@ -646,10 +648,16 @@ if macro and price and master:
                          f"**DO NOT SELL YET.** The overall trend is strongly bullish. The gap will likely close by WTI rising further, not MCX dropping. Wait for MCX to stabilize below its Open price.")
             else:
                 sl_price = max(price['high'], spot + 20) if price['high'] else spot + 20
-                st.error(f"🚨 **SAFE GAP ALERT (Drop Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
-                         f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
-                         f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).\n"
-                         f"🛡️ **Safe Stop Loss:** ~**{sl_price:,.2f}** (Above Day High). Give it room!")
+                alert_msg = (f"🚨 **SAFE GAP ALERT (Drop Expected)**: WTI is **{macro['wti_pct']:.2f}%**, Adjusted for INR is **{adjusted_wti_pct:.2f}%**. MCX is at **{price['pct']:.2f}%**. Gap is **{gap_val:.2f}%**.\n\n"
+                             f"👉 **Trade Plan:** Expect MCX to drop to fill the gap.\n"
+                             f"🎯 **Target Price:** ~**{expected_price:,.2f}** (Drop of ~{abs(gap_points):.0f} points).\n"
+                             f"🛡️ **Safe Stop Loss:** ~**{sl_price:,.2f}** (Above Day High). Give it room!")
+                
+                # NEW: 1.63% SCALP LOGIC - ONLY FOR RED ALERTS
+                if gap_val > 1.63:
+                    alert_msg += f"\n\n🔥 **ULTRA-HIGH PROBABILITY SCALP**: Gap is > 1.63%. Take a quick 10-point SHORT scalp. Target: {spot - 10:.2f}. Strict 5-10 point SL."
+                
+                st.error(alert_msg)
     else:
         st.info(f"✅ WTI and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
     st.markdown("---")
@@ -677,7 +685,6 @@ elif master["decision"] in ("WEAK BUY", "WEAK SELL"):
 else:
     st.info("⚪ **NO TRADE** — Indicators are conflicting. The market might be trapping OI writers. Wait for alignment.")
 
-# ... (Rest of the code remains exactly the same) ...
 st.subheader("Open Interest by Strike")
 st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
 st.subheader("Change in OI by Strike")
