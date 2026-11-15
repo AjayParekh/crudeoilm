@@ -45,22 +45,33 @@ def send_email_alert(subject, body):
     try:
         sender = st.secrets.get("EMAIL_SENDER")
         password = st.secrets.get("EMAIL_PASSWORD")
-        receiver = st.secrets.get("EMAIL_RECEIVER")
         smtp_server = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
         smtp_port = st.secrets.get("SMTP_PORT", 465)
+        
+        # Fetch multiple receivers
+        receivers_raw = st.secrets.get("EMAIL_RECEIVER")
+        if not receivers_raw:
+            return False, "No EMAIL_RECEIVER found in secrets."
+            
+        # Handle both a single string (comma separated) and a list from TOML
+        if isinstance(receivers_raw, str):
+            receivers = [email.strip() for email in receivers_raw.split(",") if email.strip()]
+        else:
+            receivers = [str(email).strip() for email in receivers_raw]
 
-        if not all([sender, password, receiver]):
-            return False, "Credentials missing in Streamlit Secrets."
+        if not all([sender, password]):
+            return False, "Sender credentials missing in Streamlit Secrets."
 
         msg = EmailMessage()
         msg.set_content(body)
         msg['Subject'] = subject
         msg['From'] = sender
-        msg['To'] = receiver
+        msg['To'] = ", ".join(receivers) # Join all emails for the header
 
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as smtp:
             smtp.login(sender, password)
             smtp.send_message(msg)
+            
         return True, "Success"
     except Exception as e:
         return False, str(e)
