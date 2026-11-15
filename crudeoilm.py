@@ -24,7 +24,7 @@ now = dt.datetime.now(IST)
 today = now.date()
 
 # ==============================
-# TOKEN
+# TOKEN & EMAIL ENGINE
 # ==============================
 DEFAULT_TOKEN = "Bearer eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIxMDM2NjciLCJqdGkiOiI2OWQyMzJlMWNjZDUyZDRjZDQzMzc5NjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc3NTM4MzI2NSwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODA2OTYyNDAwfQ.VFRZ5NP87NM1Vyn4-bCB2FAvanu4wsueNHo_POQtPv8"
 
@@ -40,13 +40,9 @@ def get_token():
     tok = DEFAULT_TOKEN or tok or os.environ.get("UPSTOX_TOKEN") or st.session_state.get("tok_input")
     return tok
 
-# ==============================
-# EMAIL ENGINE
-# ==============================
 def send_email_alert(subject, body):
     """Sends an email alert securely using credentials from secrets.toml"""
     try:
-        # Fetch credentials from Streamlit Secrets
         sender = st.secrets.get("EMAIL_SENDER")
         password = st.secrets.get("EMAIL_PASSWORD")
         receiver = st.secrets.get("EMAIL_RECEIVER")
@@ -54,8 +50,7 @@ def send_email_alert(subject, body):
         smtp_port = st.secrets.get("SMTP_PORT", 465)
 
         if not all([sender, password, receiver]):
-            print("Email credentials not found in secrets.toml. Skipping email.")
-            return False
+            return False, "Credentials missing in Streamlit Secrets."
 
         msg = EmailMessage()
         msg.set_content(body)
@@ -63,14 +58,12 @@ def send_email_alert(subject, body):
         msg['From'] = sender
         msg['To'] = receiver
 
-        # Connect and send
         with smtplib.SMTP_SSL(smtp_server, smtp_port) as smtp:
             smtp.login(sender, password)
             smtp.send_message(msg)
-        return True
+        return True, "Success"
     except Exception as e:
-        print(f"Failed to send email: {e}")
-        return False
+        return False, str(e)
 
 st.markdown("""
 <style>
@@ -95,6 +88,19 @@ st.markdown("""
 with st.sidebar:
     st.title("🛢️ CRUDEOILM Settings")
     st.markdown(f"### 🕒 IST: {now.strftime('%H:%M:%S')}")
+    
+    # --- TEST EMAIL BUTTON ---
+    st.markdown("---")
+    if st.button("📧 Send Test Email"):
+        with st.spinner("Sending..."):
+            ok, msg = send_email_alert("Test Email from CRUDEOILM App", "This is a test email. If you received this, your credentials are working perfectly!")
+            if ok:
+                st.success("Test email sent successfully! Check your inbox.")
+            else:
+                st.error(f"Failed to send: {msg}")
+    st.markdown("---")
+    # -------------------------
+
     if not get_token():
         st.text_input("Upstox token (Bearer ...)", type="password", key="tok_input")
     buffer_pts = st.number_input("Trigger buffer (points)", 1, 200, 10, 1)
