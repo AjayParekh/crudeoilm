@@ -4,6 +4,8 @@ from urllib.parse import quote
 import json
 import os
 import datetime as dt
+import smtplib
+from email.message import EmailMessage
 
 import pandas as pd
 import pytz
@@ -37,6 +39,38 @@ def get_token():
             pass
     tok = DEFAULT_TOKEN or tok or os.environ.get("UPSTOX_TOKEN") or st.session_state.get("tok_input")
     return tok
+
+# ==============================
+# EMAIL ENGINE
+# ==============================
+def send_email_alert(subject, body):
+    """Sends an email alert securely using credentials from secrets.toml"""
+    try:
+        # Fetch credentials from Streamlit Secrets
+        sender = st.secrets.get("EMAIL_SENDER")
+        password = st.secrets.get("EMAIL_PASSWORD")
+        receiver = st.secrets.get("EMAIL_RECEIVER")
+        smtp_server = st.secrets.get("SMTP_SERVER", "smtp.gmail.com")
+        smtp_port = st.secrets.get("SMTP_PORT", 465)
+
+        if not all([sender, password, receiver]):
+            print("Email credentials not found in secrets.toml. Skipping email.")
+            return False
+
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg['Subject'] = subject
+        msg['From'] = sender
+        msg['To'] = receiver
+
+        # Connect and send
+        with smtplib.SMTP_SSL(smtp_server, smtp_port) as smtp:
+            smtp.login(sender, password)
+            smtp.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        return False
 
 st.markdown("""
 <style>
@@ -538,7 +572,7 @@ def compute_master_confluence(price, chain, ds, macro):
     if macro and price and not macro["is_market_closed"]:
         adjusted_wti_pct = macro["adjusted_wti_pct"]
         gap = abs(price["pct"] - adjusted_wti_pct)
-        if gap > 1.00:  # CHANGED FROM 0.50 to 1.00
+        if gap > 1.00:  
             if adjusted_wti_pct > price["pct"]: wti_score = 1.0
             elif adjusted_wti_pct < price["pct"]: wti_score = -1.0
 
@@ -613,7 +647,7 @@ with c4:
         st.markdown(f"""<div class="card"><div style="color:#666">Macro Data</div><div>Unavailable (API Blocked)</div></div>""", unsafe_allow_html=True)
 
 # ==============================
-# SAFE GAP ALERT LOGIC (INTEGRATED WITH MASTER)
+# SAFE GAP ALERT LOGIC WITH EMAIL INTEGRATION
 # ==============================
 if macro and price and master:
     adjusted_wti_pct = macro["adjusted_wti_pct"]
@@ -626,8 +660,10 @@ if macro and price and master:
     
     if macro["is_market_closed"]:
          st.info(f"⚪ **US MARKET CLOSED / FLAT**: WTI is showing 0.00% change. Gap alerts are paused.")
+         st.session_state["email_sent_red"] = False
+         st.session_state["email_sent_green"] = False
     elif gap_val > 1.00:
-        # GAP RISE EXPECTED
+        # GAP RISE EXPECTED (GREEN ALERT)
         if adjusted_wti_pct > price["pct"]:
             if master["pa_score"] < 0 or master["final_score"] < -0.1:
                 st.error(f"🛑 **TRAP ALERT (Rise Expected, But Trend is Bearish)**: WTI is **{macro['wti_pct']:.2f}%**, MCX is **{price['pct']:.2f}%** (Gap: {gap_val:.2f}%).\n\n"
@@ -640,8 +676,15 @@ if macro and price and master:
                              f"🛡️ **Safe Stop Loss:** ~**{sl_price:,.2f}** (Below Day Low). Give it room!")
                 
                 st.success(alert_msg)
+                
+                # --- EMAIL TRIGGER FOR GREEN ALERT ---
+                if not st.session_state.get("email_sent_green", False):
+                    email_body = f"Time: {now.strftime('%H:%M:%S IST')}\n\n{alert_msg}"
+                    if send_email_alert("🚨 CRUDEOIL GAP ALERT (Rise Expected)", email_body):
+                        st.toast("📧 Email Alert Sent!")
+                    st.session_state["email_sent_green"] = True
         
-        # GAP DROP EXPECTED
+        # GAP DROP EXPECTED (RED ALERT)
         else:
             if master["pa_score"] > 0 or master["final_score"] > 0.1:
                 st.error(f"🛑 **TRAP ALERT (Drop Expected, But Trend is Bullish)**: WTI is **{macro['wti_pct']:.2f}%**, MCX is **{price['pct']:.2f}%** (Gap: {gap_val:.2f}%).\n\n"
@@ -658,8 +701,18 @@ if macro and price and master:
                     alert_msg += f"\n\n🔥 **ULTRA-HIGH PROBABILITY SCALP**: Gap is > 1.63%. Take a quick 10-point SHORT scalp. Target: {spot - 10:.2f}. Strict 5-10 point SL."
                 
                 st.error(alert_msg)
+                
+                # --- EMAIL TRIGGER FOR RED ALERT ---
+                if not st.session_state.get("email_sent_red", False):
+                    email_body = f"Time: {now.strftime('%H:%M:%S IST')}\n\n{alert_msg}"
+                    if send_email_alert("🚨 CRUDEOIL GAP ALERT (Drop Expected)", email_body):
+                        st.toast("📧 Email Alert Sent!")
+                    st.session_state["email_sent_red"] = True
     else:
         st.info(f"✅ WTI and MCX are in sync (Gap: {gap_val:.2f}%). No catch-up trade available.")
+        # Reset the locks so it can email you again on the next big gap
+        st.session_state["email_sent_red"] = False
+        st.session_state["email_sent_green"] = False
     st.markdown("---")
 
 if chain is None or chain.empty:
