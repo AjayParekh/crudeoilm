@@ -183,6 +183,19 @@ if not futs:
     st.error("No active CRUDEOILM futures found.")
     st.stop()
 
+# ==============================
+# SMART FILTER: ONLY SHOW FUTURES THAT HAVE OPTIONS
+# ==============================
+valid_futs = []
+for f in futs:
+    has_opts = any(i["type"] in ("CE", "PE") and i["underlying_key"] == f["key"] and i["expiry"] >= today_iso for i in ins)
+    if has_opts:
+        valid_futs.append(f)
+
+if valid_futs:
+    futs = valid_futs
+# ==============================
+
 with st.sidebar:
     st.markdown("---")
     fut_labels = {f"{f['symbol']} (exp {f['expiry']})": f for f in futs}
