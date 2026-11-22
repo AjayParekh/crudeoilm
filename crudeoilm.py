@@ -24,7 +24,7 @@ now = dt.datetime.now(IST)
 today = now.date()
 
 # ==============================
-# CSS STYLES (Matching Nifty Reference)
+# CSS STYLES (Nifty Ecosystem Style)
 # ==============================
 st.markdown("""
 <style>
@@ -40,8 +40,7 @@ st.markdown("""
 .neutral { background: linear-gradient(135deg, #2c3e50, #4ca1af); }
 .alert-box { padding: 15px; border-radius: 10px; margin-bottom: 15px; font-weight: bold; }
 .alert-trap { background-color: #f8d7da; color: #721c24; border-left: 5px solid #dc3545; }
-.alert-safe-green { background-color: #d4edda; color: #155724; border-left: 5px solid #28a745; }
-.alert-safe-red { background-color: #f8d7da; color: #721c24; border-left: 5px solid #dc3545; }
+.alert-safe { background-color: #d4edda; color: #155724; border-left: 5px solid #28a745; }
 .alert-info { background-color: #d1ecf1; color: #0c5460; border-left: 5px solid #17a2b8; }
 .section-header { font-size: 1.2rem; font-weight: bold; margin-bottom: 10px; border-bottom: 2px solid #eee; padding-bottom: 5px; }
 </style>
@@ -72,8 +71,7 @@ def send_email_alert(subject, body):
         smtp_port = st.secrets.get("SMTP_PORT", 465)
         
         receivers_raw = st.secrets.get("EMAIL_RECEIVER")
-        if not receivers_raw:
-            return False, "No EMAIL_RECEIVER found."
+        if not receivers_raw: return False, "No EMAIL_RECEIVER found."
         if isinstance(receivers_raw, str):
             receivers = [email.strip() for email in receivers_raw.split(",") if email.strip()]
         else:
@@ -136,7 +134,7 @@ def api_get(path, params):
     except Exception: return {"status": "error"}
 
 # ==============================
-# DATA FETCHING & CALCULATIONS (UNTOUCHED LOGIC)
+# INSTRUMENT MASTERS
 # ==============================
 def ms_to_date(ms): return dt.datetime.fromtimestamp(ms / 1000, IST).date()
 
@@ -162,8 +160,6 @@ except Exception as e: st.error(f"Instrument Error: {e}"); st.stop()
 
 today_iso = today.isoformat()
 futs = sorted([i for i in ins if i["type"] == "FUT" and i["expiry"] >= today_iso], key=lambda x: x["expiry"])
-
-# Smart filter for futures with options
 valid_futs = [f for f in futs if any(i["type"] in ("CE", "PE") and i["underlying_key"] == f["key"] for i in ins)]
 if valid_futs: futs = valid_futs
 
@@ -177,6 +173,9 @@ with st.sidebar:
 
 FUT_KEY = fut["key"]
 
+# ==============================
+# DATA FETCHING
+# ==============================
 def get_price():
     j = api_get("/v2/market-quote/quotes", {"instrument_key": FUT_KEY})
     if j.get("status") == "success" and j.get("data"):
@@ -197,8 +196,7 @@ def get_macro_data():
         wti_meta = r_wti.json()['chart']['result'][0]['meta']
         r_inr = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X", headers=headers, timeout=5)
         inr_meta = r_inr.json()['chart']['result'][0]['meta']
-    except Exception:
-        return None
+    except Exception: return None
     try:
         wti_ltp = wti_meta.get('regularMarketPrice', 0.0)
         wti_prev = wti_meta.get('chartPreviousClose', wti_ltp)
@@ -216,6 +214,9 @@ def get_macro_data():
 price = get_price()
 macro = get_macro_data()
 
+# ==============================
+# OPTION CHAIN FULL LOGIC
+# ==============================
 def _chunks(lst, n):
     for i in range(0, len(lst), n): yield lst[i:i + n]
 
@@ -227,9 +228,7 @@ def _fetch_prev_oi(key, day_iso):
         if str(c[0])[:10] < day_iso and len(c) > 6 and c[6] is not None: return True, c[6]
     return True, None
 
-def get_chain():
-    if not opt_expiry: return None, "No option expiry found"
-    # Using Option API first
+def chain_from_option_api():
     j = api_get("/v2/option/chain", {"instrument_key": FUT_KEY, "expiry_date": opt_expiry})
     rows = []
     if j.get("status") == "success":
@@ -247,16 +246,124 @@ def get_chain():
                 "has_chg": True,
             })
     df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True) if rows else None
+    return df, json.dumps(j)[:500]
+
+def chain_from_instruments(spot):
+    opts = [i for i in ins if i["type"] in ("CE", "PE") and i["underlying_key"] == FUT_KEY and i["expiry"] == opt_expiry and i.get("strike") is not None]
+    if not opts: return None, "No CE/PE instruments found."
+    by_strike = {}
+    for o in opts: by_strike.setdefault(float(o["strike"]), {})[o["type"]] = o["key"]
+    strikes = sorted(by_strike)
+
+    quotes = {}
+    for ch in _chunks([o["key"] for o in opts], 300):
+        j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(ch)})
+        if j.get("status") != "success": return None, "quotes error"
+        for v in (j.get("data") or {}).values(): quotes[v.get("instrument_token")] = v
+
+    mid = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot)) if spot else len(strikes) // 2
+    win = strikes[max(0, mid - strike_window): mid + strike_window + 1]
+    wkeys = [k for s_ in win for k in by_strike[s_].values()]
+
+    greeks = {}
+    for ch in _chunks(wkeys, 50):
+        j = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(ch)})
+        if j.get("status") == "success": greeks.update(j.get("data") or {})
+
+    cache = st.session_state.setdefault("prev_oi", {})
+    todo = [k for k in wkeys if (k, today_iso) not in cache]
+    if todo:
+        with ThreadPoolExecutor(8) as ex:
+            for k, (ok, v) in zip(todo, ex.map(lambda k: _fetch_prev_oi(k, today_iso), todo)):
+                if ok: cache[(k, today_iso)] = v
+
+    rows = []
+    for s_ in strikes:
+        ck, pk = by_strike[s_].get("CE"), by_strike[s_].get("PE")
+        cq, pq = quotes.get(ck) or {}, quotes.get(pk) or {}
+        cg, pg = greeks.get(ck) or {}, greeks.get(pk) or {}
+        c_oi, p_oi = cq.get("oi") or 0, pq.get("oi") or 0
+        c_prev, p_prev = cache.get((ck, today_iso)), cache.get((pk, today_iso))
+        has = (s_ in win) and c_prev is not None and p_prev is not None
+        rows.append({
+            "strike": s_, "call_oi": c_oi, "put_oi": p_oi,
+            "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0,
+            "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
+            "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
+            "call_delta": cg.get("delta") or 0, "call_gamma": cg.get("gamma") or 0, "call_theta": cg.get("theta") or 0, "call_vega": cg.get("vega") or 0, "call_iv": cg.get("iv") or 0,
+            "put_delta": pg.get("delta") or 0, "put_gamma": pg.get("gamma") or 0, "put_theta": pg.get("theta") or 0, "put_vega": pg.get("vega") or 0, "put_iv": pg.get("iv") or 0,
+            "has_chg": has,
+        })
+    df = pd.DataFrame(rows).reset_index(drop=True)
     return df, None
 
-chain, chain_err = get_chain()
+def get_chain():
+    if not opt_expiry: return None, "No option expiry found", "none", ""
+    df, raw = chain_from_option_api()
+    if df is not None: return df, None, "Upstox option-chain API", raw
+    df, err = chain_from_instruments(price["ltp"] if price else 0)
+    return df, err, "Instrument master", raw
+
+chain, chain_err, chain_src, chain_raw = get_chain()
+
 if chain is not None:
     chain = chain[((chain["call_oi"] > min_liquidity) | (chain["put_oi"] > min_liquidity)) & ((chain["call_vol"] > min_liquidity) | (chain["put_vol"] > min_liquidity))].reset_index(drop=True)
 
-def compute_directional_score(chain, spot):
+# ==============================
+# MATH & SCORING ENGINES (RESTORED)
+# ==============================
+def compute_crude_flow():
+    keys = [f["key"] for f in futs]
+    j = api_get("/v2/market-quote/quotes", {"instrument_key": ",".join(keys)})
+    if j.get("status") != "success": return {"score": 0.0, "rows": [], "err": "API Error"}
+    q = {v.get("instrument_token"): v for v in (j.get("data") or {}).values()}
+    cache = st.session_state.setdefault("prev_oi", {})
+    for k in keys:
+        if (k, today_iso) not in cache:
+            ok, v = _fetch_prev_oi(k, today_iso)
+            if ok: cache[(k, today_iso)] = v
+
+    big = flow_big_cr * 1e7
+    rows, wsum, wtot = [], 0.0, 0.0
+    for f in futs:
+        v = q.get(f["key"]) or {}
+        last, chg, oi = v.get("last_price") or 0, v.get("net_change") or 0, v.get("oi") or 0
+        prev_oi = cache.get((f["key"], today_iso))
+        if not last or prev_oi is None: continue
+        lot = float(f.get("lot_size") or 10)
+        prev_px = last - chg
+        price_pct = chg / prev_px * 100 if prev_px else 0
+        cur_val = oi * lot * last
+        chg_abs = (oi - prev_oi) * lot * last
+        oi_pct = (oi - prev_oi) / prev_oi * 100 if prev_oi else 0
+        if cur_val < 100_000_000: continue
+
+        score = 0.0
+        if chg_abs > big and price_pct < -0.3: score = -0.9
+        elif chg_abs > big and price_pct > 0.3: score = 0.9
+        elif oi_pct > flow_pct * 3 and price_pct < -0.3: score = -0.6
+        elif oi_pct > flow_pct and price_pct < -0.5: score = -0.4
+        elif oi_pct > flow_pct and price_pct > 0.5: score = 0.4
+
+        label = "Long Buildup" if price_pct >= 0 else "Short Buildup" if oi_pct >= 0 else "Long Unwinding" if price_pct < 0 else "Short Covering"
+        weight = cur_val / 1e9
+        wsum += score * weight
+        wtot += weight
+        rows.append({"contract": f["symbol"], "price": last, "price_chg_%": round(price_pct, 2), "oi": oi, "prev_oi": prev_oi, "oi_chg_%": round(oi_pct, 2), "oi_value": cur_val, "oi_value_chg": chg_abs, "view": label, "score": score, "weight": round(weight, 3)})
+    final = max(-1, min(1, wsum / wtot)) if wtot else 0.0
+    return {"score": final, "rows": rows, "err": None}
+
+def max_pain(df):
+    best, low = None, float("inf")
+    for s in df["strike"]:
+        pain = ((s - df["strike"]).clip(lower=0) * df["call_oi"]).sum() + ((df["strike"] - s).clip(lower=0) * df["put_oi"]).sum()
+        if pain < low: best, low = s, pain
+    return best
+
+def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
     if chain is None or chain.empty: return None
     d = chain[chain["has_chg"]].copy()
-    if len(d) < 3: return None
+    if d.empty or len(d) < 3: return None
     strikes = sorted(d["strike"].unique())
     atm = min(strikes, key=lambda s: abs(s - spot))
     atm_idx = strikes.index(atm)
@@ -264,26 +371,30 @@ def compute_directional_score(chain, spot):
 
     d["pc_diff"] = d["put_chg"].astype(float) - d["call_chg"].astype(float)
     d["abs_diff"] = d["pc_diff"].abs()
-    top = d.nlargest(5, "abs_diff")
+    top = d.nlargest(top_n_strikes, "abs_diff")
     top_raw = (float((top["pc_diff"] * top["abs_diff"]).sum() / top["abs_diff"].sum()) if top["abs_diff"].sum() > 0 else 0.0)
-    atm_raw = float(get_row(atm)["put_chg"]) - float(get_row(atm)["call_chg"])
-    up_strike = strikes[atm_idx + 1] if atm_idx + 1 < len(strikes) else None
-    up_raw = (float(get_row(up_strike)["put_chg"]) - float(get_row(up_strike)["call_chg"])) if up_strike else 0.0
-    down_strike = strikes[atm_idx - 1] if atm_idx - 1 >= 0 else None
-    down_raw = (float(get_row(down_strike)["put_chg"]) - float(get_row(down_strike)["call_chg"])) if down_strike else 0.0
     
-    itm_call_strikes = [s for s in strikes if s < spot][-3:]
-    itm_put_strikes  = [s for s in strikes if s > spot][:3]
+    r = get_row(atm)
+    atm_raw = float(r["put_chg"]) - float(r["call_chg"])
+    up_strike = strikes[atm_idx + 1] if atm_idx + 1 < len(strikes) else None
+    up_raw = (float(get_row(up_strike)["put_chg"]) - float(get_row(up_strike)["call_chg"])) if up_strike is not None else 0.0
+    down_strike = strikes[atm_idx - 1] if atm_idx - 1 >= 0 else None
+    down_raw = (float(get_row(down_strike)["put_chg"]) - float(get_row(down_strike)["call_chg"])) if down_strike is not None else 0.0
+
+    itm_call_strikes = [s for s in strikes if s < spot][-itm_count:]
+    itm_put_strikes  = [s for s in strikes if s > spot][:itm_count]
     itm_call_avg = (sum(float(get_row(s)["call_chg"]) for s in itm_call_strikes) / len(itm_call_strikes)) if itm_call_strikes else 0.0
     itm_put_avg  = (sum(float(get_row(s)["put_chg"]) for s in itm_put_strikes) / len(itm_put_strikes)) if itm_put_strikes else 0.0
     itm_raw = itm_put_avg - itm_call_avg
 
     scale = max(float(d["call_chg"].abs().max()), float(d["put_chg"].abs().max()), 1.0)
     def clip(x): return max(-1.0, min(1.0, x))
-    norm = {"Top ΔOI": clip(top_raw / scale), "ATM": clip(atm_raw / scale), "1↑ OTM": clip(up_raw / scale), "1↓ OTM": clip(down_raw / scale), "ITM": clip(itm_raw / scale)}
-    final = clip((norm["Top ΔOI"]*0.3) + (norm["ATM"]*0.2) + (norm["1↑ OTM"]*0.15) + (norm["1↓ OTM"]*0.15) + (norm["ITM"]*0.2))
-    
-    return {"final": final, "atm": atm, "up_strike": up_strike, "down_strike": down_strike, "norm": norm}
+
+    norm = {"Top ΔOI diff": clip(top_raw / scale), "ATM": clip(atm_raw / scale), "1↑ OTM (call)": clip(up_raw / scale), "1↓ OTM (put)": clip(down_raw / scale), "ITM": clip(itm_raw / scale)}
+    weights = {"Top ΔOI diff": 0.30, "ATM": 0.20, "1↑ OTM (call)": 0.15, "1↓ OTM (put)": 0.15, "ITM": 0.20}
+    final = clip(sum(norm[k] * weights[k] for k in norm))
+
+    return {"final": final, "pct": round(final * 100, 1), "atm": atm, "up_strike": up_strike, "down_strike": down_strike, "itm_call_strikes": itm_call_strikes, "itm_put_strikes": itm_put_strikes, "norm": norm, "weights": weights, "raw": {"Top ΔOI diff": top_raw, "ATM": atm_raw, "1↑ OTM (call)": up_raw, "1↓ OTM (put)": down_raw, "ITM": itm_raw}, "top_table": top[["strike", "call_chg", "put_chg", "pc_diff"]].reset_index(drop=True), "chain": d}
 
 def compute_master_confluence(price, chain, ds, macro):
     oi_score = ds["final"] if ds else 0.0
@@ -322,36 +433,40 @@ def compute_master_confluence(price, chain, ds, macro):
 spot = price["ltp"] if price else 0
 ds = compute_directional_score(chain, spot) if chain is not None else None
 master = compute_master_confluence(price, chain, ds, macro) if chain is not None else None
+flow = compute_crude_flow()
 
 # ==============================
-# UI RENDER (NIFTY STYLE)
+# UI RENDER
 # ==============================
 st.title("🛢️ CRUDEOILM Ecosystem — MCX")
 
 # Top Cards
-def render_card(label, value, chg, pct, is_inr=False):
+def render_card(label, value, chg, pct):
     cls = "pos" if chg >= 0 else "neg"
     arrow = "▲" if chg > 0 else "▼" if chg < 0 else "—"
-    val_str = f"{value:,.3f}" if is_inr else f"{value:,.2f}"
-    chg_str = f"{arrow} {chg:+.3f} ({pct:+.2f}%)" if is_inr else f"{arrow} {chg:+,.2f} ({pct:+.2f}%)"
+    val_str = f"{value:,.2f}"
+    chg_str = f"{arrow} {chg:+,.2f} ({pct:+.2f}%)"
     return f'<div class="card"><div class="metric-label">{label}</div><div class="big-price">{val_str}</div><div class="{cls}">{chg_str}</div></div>'
 
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.markdown(render_card(f"CRUDEOILM ({fut['symbol']})", spot, price['chg'], price['pct']), unsafe_allow_html=True)
-with c2: st.markdown(render_card("Futures OI / Volume", price['oi'] or 0, price['volume'] or 0, 0), unsafe_allow_html=True)
+with c2: 
+    st.markdown(f"""<div class="card"><div class="metric-label">FUTURES OI / VOLUME</div>
+      <div class="big-price">{price['oi']:,.0f}</div>
+      <div class="pos">Vol: {price['volume']:,.0f}</div></div>""", unsafe_allow_html=True)
 with c3: 
     if macro: st.markdown(render_card("WTI Crude", macro['wti_ltp'], macro['wti_chg'], macro['wti_pct']), unsafe_allow_html=True)
     else: st.markdown('<div class="card">WTI Data Unavailable</div>', unsafe_allow_html=True)
 with c4:
-    if macro: st.markdown(render_card("USD/INR", macro['inr_ltp'], macro['inr_chg'], macro['inr_pct'], is_inr=True), unsafe_allow_html=True)
+    if macro: st.markdown(render_card("USD/INR", macro['inr_ltp'], macro['inr_chg'], macro['inr_pct']), unsafe_allow_html=True)
     else: st.markdown('<div class="card">INR Data Unavailable</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
-# External Alert Logic (Existing Logic Unchanged)
+# External Alert Logic
 alert_status = "IN_SYNC"
 gap_val = 0
-if macro and price and not macro["is_market_closed"]:
+if macro and price and master and not macro["is_market_closed"]:
     adjusted = macro["adjusted_wti_pct"]
     gap_val = abs(price["pct"] - adjusted)
     expected_price = price["prev"] * (1 + adjusted / 100)
@@ -368,9 +483,9 @@ if macro and price and not macro["is_market_closed"]:
 if alert_status == "TRAP_RISE" or alert_status == "TRAP_DROP":
     st.markdown(f'<div class="alert-box alert-trap">🛑 <b>TRAP ALERT ({alert_status.replace("_", " ")})</b><br>WTI implies MCX should move <b>{gap_val:.2f}%</b>, but Internal Trend is diverging. <b>DO NOT TRADE THE GAP.</b></div>', unsafe_allow_html=True)
 elif alert_status == "SAFE_RISE":
-    st.markdown(f'<div class="alert-box alert-safe-green">🚨 <b>SAFE GAP ALERT (Rise Expected)</b><br>WTI implies MCX should rise <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="alert-box alert-safe">🚨 <b>SAFE GAP ALERT (Rise Expected)</b><br>WTI implies MCX should rise <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
 elif alert_status == "SAFE_DROP":
-    st.markdown(f'<div class="alert-box alert-safe-red">🚨 <b>SAFE GAP ALERT (Drop Expected)</b><br>WTI implies MCX should drop <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="alert-box alert-trap">🚨 <b>SAFE GAP ALERT (Drop Expected)</b><br>WTI implies MCX should drop <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
 else:
     st.markdown(f'<div class="alert-box alert-info">⚪ <b>EXTERNAL MACRO IN SYNC</b> — Gap is {gap_val:.2f}%.</div>', unsafe_allow_html=True)
 
@@ -443,7 +558,9 @@ with ecol2:
         """)
 
 
-# OI Charts & Tables (Kept as requested)
+# ==============================
+# OI CHARTS & TABLES (RESTORED)
+# ==============================
 st.markdown("---")
 st.subheader("Open Interest by Strike")
 if chain is not None: st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
@@ -465,5 +582,27 @@ if chain is not None:
     chg_tbl["OI Difference"] = (chg_tbl["put_chg"] - chg_tbl["call_chg"]).abs()
     st.subheader("Change in OI (Top by difference)")
     st.dataframe(chg_tbl.sort_values("OI Difference", ascending=False).head(top_n).reset_index(drop=True).style.apply(hl_top5, axis=1), use_container_width=True)
+
+# Directional OI Score Breakdown
+st.subheader("🎯 Directional OI Score Breakdown")
+if ds:
+    st.markdown(f"**OI Score:** {ds['final']:+.2f} (ATM {ds['atm']:g} | 1↑ OTM {ds['up_strike']} | 1↓ OTM {ds['down_strike']})")
+    col_a, col_b = st.columns([3, 2])
+    with col_a:
+        breakdown = pd.DataFrame([{"Component": k, "Raw ΔPut−ΔCall": round(ds["raw"][k], 0), "Normalized": round(ds["norm"][k], 2), "Weight": ds["weights"][k]} for k in ds["norm"]])
+        st.dataframe(breakdown, use_container_width=True)
+    with col_b:
+        st.markdown("""
+        **How to read:**
+        - **Put ΔOI ↑** → Bullish
+        - **Call ΔOI ↑** → Bearish
+        - **ITM Call ΔOI ↑** → Bearish
+        - **ITM Put ΔOI ↑** → Bullish
+        """)
+
+# Futures OI Flow
+if flow["rows"]:
+    st.subheader(f"CRUDEOILM Futures OI Flow — Macro Score: {flow['score']:.2f}")
+    st.dataframe(pd.DataFrame(flow["rows"]), use_container_width=True)
 
 st.caption(f"Data Status: OK | Last updated: {now.strftime('%H:%M:%S IST')}")
