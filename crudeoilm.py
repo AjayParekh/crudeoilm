@@ -397,9 +397,10 @@ def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
     return {"final": final, "pct": round(final * 100, 1), "atm": atm, "up_strike": up_strike, "down_strike": down_strike, "itm_call_strikes": itm_call_strikes, "itm_put_strikes": itm_put_strikes, "norm": norm, "weights": weights, "raw": {"Top ΔOI diff": top_raw, "ATM": atm_raw, "1↑ OTM (call)": up_raw, "1↓ OTM (put)": down_raw, "ITM": itm_raw}, "top_table": top[["strike", "call_chg", "put_chg", "pc_diff"]].reset_index(drop=True), "chain": d}
 
 def compute_master_confluence(price, chain, ds, macro):
+    if chain is None: return None
     oi_score = ds["final"] if ds else 0.0
-    tc_vol = chain["call_vol"].sum() if chain is not None else 0
-    tp_vol = chain["put_vol"].sum() if chain is not None else 0
+    tc_vol = chain["call_vol"].sum() if not chain.empty else 0
+    tp_vol = chain["put_vol"].sum() if not chain.empty else 0
     tot_vol = tc_vol + tp_vol
     vol_score = ((tp_vol - tc_vol) / tot_vol) if tot_vol > 0 else 0.0
     
@@ -432,7 +433,7 @@ def compute_master_confluence(price, chain, ds, macro):
 
 spot = price["ltp"] if price else 0
 ds = compute_directional_score(chain, spot) if chain is not None else None
-master = compute_master_confluence(price, chain, ds, macro) if chain is not None else None
+master = compute_master_confluence(price, chain, ds, macro)
 flow = compute_crude_flow()
 
 # ==============================
@@ -483,9 +484,9 @@ if macro and price and master and not macro["is_market_closed"]:
 if alert_status == "TRAP_RISE" or alert_status == "TRAP_DROP":
     st.markdown(f'<div class="alert-box alert-trap">🛑 <b>TRAP ALERT ({alert_status.replace("_", " ")})</b><br>WTI implies MCX should move <b>{gap_val:.2f}%</b>, but Internal Trend is diverging. <b>DO NOT TRADE THE GAP.</b></div>', unsafe_allow_html=True)
 elif alert_status == "SAFE_RISE":
-    st.markdown(f'<div class="alert-box alert-safe">🚨 <b>SAFE GAP ALERT (Rise Expected)</b><br>WTI implies MCX should rise <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="alert-box alert-safe">🚨 <b>SAFE GAP ALERT (Rise Expected)</b><br>WTI implies MCX should rise <b>{gap_val:.2f}%</b>. Target: {expected_price:,.2f} (Rise ~{abs(gap_points):.0f} pts).</div>', unsafe_allow_html=True)
 elif alert_status == "SAFE_DROP":
-    st.markdown(f'<div class="alert-box alert-trap">🚨 <b>SAFE GAP ALERT (Drop Expected)</b><br>WTI implies MCX should drop <b>{gap_val:.2f}%</b>. <b>⚠️ WAIT for Internal Engine to say CONFIRM.</b></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="alert-box alert-trap">🚨 <b>SAFE GAP ALERT (Drop Expected)</b><br>WTI implies MCX should drop <b>{gap_val:.2f}%</b>. Target: {expected_price:,.2f} (Drop ~{abs(gap_points):.0f} pts).</div>', unsafe_allow_html=True)
 else:
     st.markdown(f'<div class="alert-box alert-info">⚪ <b>EXTERNAL MACRO IN SYNC</b> — Gap is {gap_val:.2f}%.</div>', unsafe_allow_html=True)
 
@@ -497,7 +498,7 @@ if "BUY" in action: css_class = "buy"
 elif "SELL" in action: css_class = "sell"
 elif action == "NEUTRAL": css_class = "wait"
 
-st.markdown(f'<div class="decision-box {css_class}"><h1 style="margin:0; font-size: 3rem;">{action.replace("_", " ")}</h1><p style="font-size: 1.2rem; margin-top: 10px;">Direction: <b>{"BULLISH" if "BUY" in action else "BEARISH" if "SELL" in action else "SIDEWAYS"}</b> | Confluence Score: <b>{master["final_score"]:+.2f}</b></p></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="decision-box {css_class}"><h1 style="margin:0; font-size: 3rem;">{action.replace("_", " ")}</h1><p style="font-size: 1.2rem; margin-top: 10px;">Direction: <b>{"BULLISH" if "BUY" in action else "BEARISH" if "SELL" in action else "SIDEWAYS"}</b> | Confluence Score: <b>{master["final_score"]:+.2f if master else 0:.2f}</b></p></div>', unsafe_allow_html=True)
 
 
 # Option Greeks (ATM Window)
