@@ -185,7 +185,7 @@ def get_price():
         ohlc = q.get("ohlc") or {}
         prev = round(last - chg, 2) if last else (ohlc.get("close") or 0)
         pct = (chg / prev * 100) if prev else 0
-        return {"ltp": last, "chg": chg, "pct": pct, "prev": prev, "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"), "oi": q.get("oi"), "volume": q.get("volume")}
+        return {"ltp": last, "chg": chg, "pct": pct, "prev": prev, "open": ohlc.get("open"), "high": ohlc.get("high"), "low": ohlc.get("low"), "oi": q.get("oi") or 0, "volume": q.get("volume") or 0}
     return None
 
 @st.cache_data(ttl=10)
@@ -310,7 +310,7 @@ if chain is not None:
     chain = chain[((chain["call_oi"] > min_liquidity) | (chain["put_oi"] > min_liquidity)) & ((chain["call_vol"] > min_liquidity) | (chain["put_vol"] > min_liquidity))].reset_index(drop=True)
 
 # ==============================
-# MATH & SCORING ENGINES (RESTORED)
+# MATH & SCORING ENGINES
 # ==============================
 def compute_crude_flow():
     keys = [f["key"] for f in futs]
@@ -352,13 +352,6 @@ def compute_crude_flow():
         rows.append({"contract": f["symbol"], "price": last, "price_chg_%": round(price_pct, 2), "oi": oi, "prev_oi": prev_oi, "oi_chg_%": round(oi_pct, 2), "oi_value": cur_val, "oi_value_chg": chg_abs, "view": label, "score": score, "weight": round(weight, 3)})
     final = max(-1, min(1, wsum / wtot)) if wtot else 0.0
     return {"score": final, "rows": rows, "err": None}
-
-def max_pain(df):
-    best, low = None, float("inf")
-    for s in df["strike"]:
-        pain = ((s - df["strike"]).clip(lower=0) * df["call_oi"]).sum() + ((df["strike"] - s).clip(lower=0) * df["put_oi"]).sum()
-        if pain < low: best, low = s, pain
-    return best
 
 def compute_directional_score(chain, spot, top_n_strikes=5, itm_count=3):
     if chain is None or chain.empty: return None
@@ -452,7 +445,7 @@ def render_card(label, value, chg, pct):
 c1, c2, c3, c4 = st.columns(4)
 with c1: st.markdown(render_card(f"CRUDEOILM ({fut['symbol']})", spot, price['chg'], price['pct']), unsafe_allow_html=True)
 with c2: 
-    st.markdown(f"""<div class="card"><div class="metric-label">FUTURES OI / VOLUME</div>
+    st.markdown(f"""<div class="card"><div class="metric-label">CRUDEOILM FUTURES OI / VOLUME</div>
       <div class="big-price">{price['oi']:,.0f}</div>
       <div class="pos">Vol: {price['volume']:,.0f}</div></div>""", unsafe_allow_html=True)
 with c3: 
@@ -491,14 +484,29 @@ else:
     st.markdown(f'<div class="alert-box alert-info">⚪ <b>EXTERNAL MACRO IN SYNC</b> — Gap is {gap_val:.2f}%.</div>', unsafe_allow_html=True)
 
 
-# Large Decision Box
-action = master["decision"] if master else "NO TRADE"
+# Large Decision Box (Fixed f-string ValueError)
+if master:
+    action = master.get("decision", "NO TRADE")
+    score_val = master.get("final_score", 0.0)
+else:
+    action = "NO TRADE"
+    score_val = 0.0
+
+direction_text = "BULLISH" if "BUY" in action else "BEARISH" if "SELL" in action else "SIDEWAYS"
+
 css_class = "neutral"
 if "BUY" in action: css_class = "buy"
 elif "SELL" in action: css_class = "sell"
 elif action == "NEUTRAL": css_class = "wait"
 
-st.markdown(f'<div class="decision-box {css_class}"><h1 style="margin:0; font-size: 3rem;">{action.replace("_", " ")}</h1><p style="font-size: 1.2rem; margin-top: 10px;">Direction: <b>{"BULLISH" if "BUY" in action else "BEARISH" if "SELL" in action else "SIDEWAYS"}</b> | Confluence Score: <b>{master["final_score"]:+.2f if master else 0:.2f}</b></p></div>', unsafe_allow_html=True)
+st.markdown(f'''
+<div class="decision-box {css_class}">
+    <h1 style="margin:0; font-size: 3rem;">{action.replace("_", " ")}</h1>
+    <p style="font-size: 1.2rem; margin-top: 10px;">
+        Direction: <b>{direction_text}</b> | Confluence Score: <b>{score_val:+.2f}</b>
+    </p>
+</div>
+''', unsafe_allow_html=True)
 
 
 # Option Greeks (ATM Window)
@@ -560,7 +568,7 @@ with ecol2:
 
 
 # ==============================
-# OI CHARTS & TABLES (RESTORED)
+# OI CHARTS & TABLES
 # ==============================
 st.markdown("---")
 st.subheader("Open Interest by Strike")
