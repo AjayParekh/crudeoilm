@@ -415,12 +415,12 @@ def compute_master_confluence(price, chain, ds, macro):
 
     final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (wti_score * 0.2)
 
-    decision, reason = "NO TRADE", "Indicators mixed."
-    if oi_score > 0.2 and vol_score > 0 and pa_score > 0: decision, reason = "STRONG BUY", "Bullish OI + Vol + PA align."
-    elif oi_score < -0.2 and vol_score < 0 and pa_score < 0: decision, reason = "STRONG SELL", "Bearish OI + Vol + PA align."
-    elif final_score > 0.3: decision, reason = "WEAK BUY", "Positive bias, not all align."
-    elif final_score < -0.3: decision, reason = "WEAK SELL", "Negative bias, not all align."
-    else: decision, reason = "NEUTRAL", "Sideways / conflicting."
+    # UPDATED LOGIC: ONLY CONFIRM BUY / SELL
+    decision, reason = "NO TRADE", "Conditions not perfectly aligned."
+    if oi_score > 0.2 and vol_score > 0 and pa_score > 0:
+        decision, reason = "CONFIRM BUY", "Bullish OI + Vol + PA align."
+    elif oi_score < -0.2 and vol_score < 0 and pa_score < 0:
+        decision, reason = "CONFIRM SELL", "Bearish OI + Vol + PA align."
 
     return {"decision": decision, "reason": reason, "final_score": final_score, "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "wti_score": wti_score}
 
@@ -484,7 +484,7 @@ else:
     st.markdown(f'<div class="alert-box alert-info">⚪ <b>EXTERNAL MACRO IN SYNC</b> — Gap is {gap_val:.2f}%.</div>', unsafe_allow_html=True)
 
 
-# Large Decision Box (Fixed f-string ValueError)
+# Large Decision Box
 if master:
     action = master.get("decision", "NO TRADE")
     score_val = master.get("final_score", 0.0)
@@ -497,7 +497,7 @@ direction_text = "BULLISH" if "BUY" in action else "BEARISH" if "SELL" in action
 css_class = "neutral"
 if "BUY" in action: css_class = "buy"
 elif "SELL" in action: css_class = "sell"
-elif action == "NEUTRAL": css_class = "wait"
+elif action == "NO TRADE": css_class = "neutral"
 
 st.markdown(f'''
 <div class="decision-box {css_class}">
