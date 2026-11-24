@@ -513,31 +513,36 @@ st.markdown(f'''
 ''', unsafe_allow_html=True)
 
 
-# Option Greeks (ATM Window)
+# Option Greeks (ATM Window) - FIXED
 st.markdown("### 📊 Option Greeks (ATM Window)")
 if chain is not None and not chain.empty:
     atm_strike = ds["atm"] if ds else 0
     near_strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:5]].sort_values("strike").copy()
     
-    # FETCH MISSING GREEKS (FIX FOR 0.000 VALUES)
-    missing_greek_keys = []
+    # Force fetch Greeks to ensure no zeros
+    greek_keys = []
     for _, row in near_strikes.iterrows():
-        if row["call_delta"] == 0 and row.get("ce_key"): missing_greek_keys.append(row["ce_key"])
-        if row["put_delta"] == 0 and row.get("pe_key"): missing_greek_keys.append(row["pe_key"])
+        if row.get("ce_key"): greek_keys.append(row["ce_key"])
+        if row.get("pe_key"): greek_keys.append(row["pe_key"])
         
-    if missing_greek_keys:
-        gk_res = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(missing_greek_keys)})
+    if greek_keys:
+        gk_res = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(greek_keys)})
         if gk_res.get("status") == "success":
             gk_data = gk_res.get("data") or {}
             for idx, row in near_strikes.iterrows():
-                if row.get("ce_key") in gk_data:
-                    near_strikes.at[idx, "call_delta"] = gk_data[row["ce_key"]].get("delta", 0) or 0
-                    near_strikes.at[idx, "call_theta"] = gk_data[row["ce_key"]].get("theta", 0) or 0
-                    near_strikes.at[idx, "call_iv"] = gk_data[row["ce_key"]].get("iv", 0) or 0
-                if row.get("pe_key") in gk_data:
-                    near_strikes.at[idx, "put_delta"] = gk_data[row["pe_key"]].get("delta", 0) or 0
-                    near_strikes.at[idx, "put_theta"] = gk_data[row["pe_key"]].get("theta", 0) or 0
-                    near_strikes.at[idx, "put_iv"] = gk_data[row["pe_key"]].get("iv", 0) or 0
+                ck, pk = row.get("ce_key"), row.get("pe_key")
+                if ck in gk_data:
+                    near_strikes.at[idx, "call_delta"] = gk_data[ck].get("delta", 0) or 0
+                    near_strikes.at[idx, "call_theta"] = gk_data[ck].get("theta", 0) or 0
+                    near_strikes.at[idx, "call_iv"] = gk_data[ck].get("iv", 0) or 0
+                    near_strikes.at[idx, "call_gamma"] = gk_data[ck].get("gamma", 0) or 0
+                    near_strikes.at[idx, "call_vega"] = gk_data[ck].get("vega", 0) or 0
+                if pk in gk_data:
+                    near_strikes.at[idx, "put_delta"] = gk_data[pk].get("delta", 0) or 0
+                    near_strikes.at[idx, "put_theta"] = gk_data[pk].get("theta", 0) or 0
+                    near_strikes.at[idx, "put_iv"] = gk_data[pk].get("iv", 0) or 0
+                    near_strikes.at[idx, "put_gamma"] = gk_data[pk].get("gamma", 0) or 0
+                    near_strikes.at[idx, "put_vega"] = gk_data[pk].get("vega", 0) or 0
 
     ce_atm = near_strikes[near_strikes["strike"] == atm_strike]
     ce_atm = ce_atm.iloc[0] if not ce_atm.empty else None
@@ -593,7 +598,7 @@ with ecol2:
 
 
 # ==============================
-# OI TABLES (CHARTS REMOVED)
+# OI TABLES
 # ==============================
 st.markdown("---")
 
