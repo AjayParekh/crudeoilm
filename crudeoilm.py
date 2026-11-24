@@ -237,7 +237,9 @@ def chain_from_option_api():
             cm, pm = c.get("market_data") or {}, p.get("market_data") or {}
             cg, pg = c.get("option_greeks") or {}, p.get("option_greeks") or {}
             rows.append({
-                "strike": it["strike_price"], "call_oi": cm.get("oi") or 0, "put_oi": pm.get("oi") or 0,
+                "strike": it["strike_price"], 
+                "ce_key": c.get("instrument_key"), "pe_key": p.get("instrument_key"),
+                "call_oi": cm.get("oi") or 0, "put_oi": pm.get("oi") or 0,
                 "call_vol": cm.get("volume") or 0, "put_vol": pm.get("volume") or 0,
                 "call_chg": (cm.get("oi") or 0) - (cm.get("prev_oi") or 0), "put_chg": (pm.get("oi") or 0) - (pm.get("prev_oi") or 0),
                 "call_ltp": cm.get("ltp"), "put_ltp": pm.get("ltp"),
@@ -286,7 +288,9 @@ def chain_from_instruments(spot):
         c_prev, p_prev = cache.get((ck, today_iso)), cache.get((pk, today_iso))
         has = (s_ in win) and c_prev is not None and p_prev is not None
         rows.append({
-            "strike": s_, "call_oi": c_oi, "put_oi": p_oi,
+            "strike": s_, 
+            "ce_key": ck, "pe_key": pk,
+            "call_oi": c_oi, "put_oi": p_oi,
             "call_vol": cq.get("volume") or 0, "put_vol": pq.get("volume") or 0,
             "call_chg": (c_oi - c_prev) if has else 0, "put_chg": (p_oi - p_prev) if has else 0,
             "call_ltp": cq.get("last_price"), "put_ltp": pq.get("last_price"),
@@ -415,12 +419,12 @@ def compute_master_confluence(price, chain, ds, macro):
 
     final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (wti_score * 0.2)
 
-    # UPDATED LOGIC: ONLY CONFIRM BUY / SELL
-    decision, reason = "NO TRADE", "Conditions not perfectly aligned."
-    if oi_score > 0.2 and vol_score > 0 and pa_score > 0:
-        decision, reason = "CONFIRM BUY", "Bullish OI + Vol + PA align."
-    elif oi_score < -0.2 and vol_score < 0 and pa_score < 0:
-        decision, reason = "CONFIRM SELL", "Bearish OI + Vol + PA align."
+    # UPDATED LOGIC: NIFTY STYLE THRESHOLD
+    decision, reason = "NO TRADE", "Indicators mixed."
+    if final_score > 0.3:
+        decision, reason = "CONFIRM BUY", "Overall bias is strongly positive."
+    elif final_score < -0.3:
+        decision, reason = "CONFIRM SELL", "Overall bias is strongly negative."
 
     return {"decision": decision, "reason": reason, "final_score": final_score, "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "wti_score": wti_score}
 
@@ -513,9 +517,30 @@ st.markdown(f'''
 st.markdown("### 📊 Option Greeks (ATM Window)")
 if chain is not None and not chain.empty:
     atm_strike = ds["atm"] if ds else 0
-    near_strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:5]].sort_values("strike")
+    near_strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:5]].sort_values("strike").copy()
     
-    ce_atm = chain[chain["strike"] == atm_strike].iloc[0] if atm_strike in chain["strike"].values else None
+    # FETCH MISSING GREEKS (FIX FOR 0.000 VALUES)
+    missing_greek_keys = []
+    for _, row in near_strikes.iterrows():
+        if row["call_delta"] == 0 and row.get("ce_key"): missing_greek_keys.append(row["ce_key"])
+        if row["put_delta"] == 0 and row.get("pe_key"): missing_greek_keys.append(row["pe_key"])
+        
+    if missing_greek_keys:
+        gk_res = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(missing_greek_keys)})
+        if gk_res.get("status") == "success":
+            gk_data = gk_res.get("data") or {}
+            for idx, row in near_strikes.iterrows():
+                if row.get("ce_key") in gk_data:
+                    near_strikes.at[idx, "call_delta"] = gk_data[row["ce_key"]].get("delta", 0) or 0
+                    near_strikes.at[idx, "call_theta"] = gk_data[row["ce_key"]].get("theta", 0) or 0
+                    near_strikes.at[idx, "call_iv"] = gk_data[row["ce_key"]].get("iv", 0) or 0
+                if row.get("pe_key") in gk_data:
+                    near_strikes.at[idx, "put_delta"] = gk_data[row["pe_key"]].get("delta", 0) or 0
+                    near_strikes.at[idx, "put_theta"] = gk_data[row["pe_key"]].get("theta", 0) or 0
+                    near_strikes.at[idx, "put_iv"] = gk_data[row["pe_key"]].get("iv", 0) or 0
+
+    ce_atm = near_strikes[near_strikes["strike"] == atm_strike]
+    ce_atm = ce_atm.iloc[0] if not ce_atm.empty else None
     
     if ce_atm is not None:
         greek_text = f"**ATM Greeks @ {atm_strike:,.0f}:** Δ Call/Put: {ce_atm['call_delta']:.2f} / {ce_atm['put_delta']:.2f} &nbsp;|&nbsp; Γ Gamma: {ce_atm['call_gamma']:.5f} &nbsp;|&nbsp; Θ Theta C/P: {ce_atm['call_theta']:.1f} / {ce_atm['put_theta']:.1f} &nbsp;|&nbsp; V Vega: {ce_atm['call_vega']:.2f} &nbsp;|&nbsp; IV Call/Put: {ce_atm['call_iv']:.1f}% / {ce_atm['put_iv']:.1f}%"
@@ -568,14 +593,9 @@ with ecol2:
 
 
 # ==============================
-# OI CHARTS & TABLES
+# OI TABLES (CHARTS REMOVED)
 # ==============================
 st.markdown("---")
-st.subheader("Open Interest by Strike")
-if chain is not None: st.bar_chart(chain.set_index("strike")[["call_oi", "put_oi"]])
-
-st.subheader("Change in OI by Strike")
-if chain is not None: st.bar_chart(chain[chain["has_chg"]].set_index("strike")[["call_chg", "put_chg"]])
 
 def hl_top5(row): return (["background-color:#ffd700;font-weight:bold;color:#000"] * len(row)) if row.name < 5 else [""] * len(row)
 
