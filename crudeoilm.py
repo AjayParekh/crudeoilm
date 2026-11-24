@@ -6,7 +6,6 @@ import os
 import datetime as dt
 import smtplib
 from email.message import EmailMessage
-import math
 
 import pandas as pd
 import pytz
@@ -435,25 +434,6 @@ master = compute_master_confluence(price, chain, ds, macro)
 flow = compute_crude_flow()
 
 # ==============================
-# GREEKS CALCULATOR FALLBACK
-# ==============================
-def calculate_greeks(spot, strike, t, r, vol, option_type="CE"):
-    if t <= 0 or vol <= 0: return 0.0, 0.0, 0.0, 0.0, 0.0
-    def norm_cdf(x): return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-    def norm_pdf(x): return math.exp(-x**2 / 2.0) / math.sqrt(2.0 * math.pi)
-    d1 = (math.log(spot / strike) + (r + 0.5 * vol**2) * t) / (vol * math.sqrt(t))
-    d2 = d1 - vol * math.sqrt(t)
-    if option_type == "CE":
-        delta = norm_cdf(d1)
-        theta = (- (spot * norm_pdf(d1) * vol) / (2 * math.sqrt(t)) - r * strike * math.exp(-r * t) * norm_cdf(d2)) / 365
-    else:
-        delta = norm_cdf(d1) - 1
-        theta = (- (spot * norm_pdf(d1) * vol) / (2 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm_cdf(-d2)) / 365
-    gamma = norm_pdf(d1) / (spot * vol * math.sqrt(t))
-    vega = (spot * norm_pdf(d1) * math.sqrt(t)) / 100
-    return delta, gamma, theta, vega, vol * 100
-
-# ==============================
 # UI RENDER
 # ==============================
 st.title("🛢️ CRUDEOILM Ecosystem — MCX")
@@ -533,67 +513,12 @@ st.markdown(f'''
 ''', unsafe_allow_html=True)
 
 
-# Option Greeks (ATM Window) - FIXED WITH STRICT TYPE CONVERSION
+# Option Greeks (ATM Window) - SAFE VERSION (NO FALLBACK)
 st.markdown("### 📊 Option Greeks (ATM Window)")
 if chain is not None and not chain.empty:
     atm_strike = ds["atm"] if ds else 0
-    near_strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:5]].sort_values("strike").copy()
+    near_strikes = chain.iloc[(chain["strike"] - spot).abs().argsort()[:5]].sort_values("strike")
     
-    # 1. Ensure all columns are strictly float type to prevent LossySetitemError
-    for c in ["call_delta", "call_gamma", "call_theta", "call_vega", "call_iv", "put_delta", "put_gamma", "put_theta", "put_vega", "put_iv"]:
-        if c in near_strikes.columns:
-            near_strikes[c] = pd.to_numeric(near_strikes[c], errors='coerce').fillna(0.0)
-    
-    # 2. Force fetch Greeks from API
-    greek_keys = []
-    for _, row in near_strikes.iterrows():
-        if row.get("ce_key"): greek_keys.append(row["ce_key"])
-        if row.get("pe_key"): greek_keys.append(row["pe_key"])
-        
-    if greek_keys:
-        gk_res = api_get("/v3/market-quote/option-greek", {"instrument_key": ",".join(greek_keys)})
-        if gk_res.get("status") == "success":
-            gk_data = gk_res.get("data") or {}
-            for idx, row in near_strikes.iterrows():
-                ck, pk = row.get("ce_key"), row.get("pe_key")
-                if ck in gk_data:
-                    near_strikes.at[idx, "call_delta"] = float(gk_data[ck].get("delta", 0) or 0)
-                    near_strikes.at[idx, "call_theta"] = float(gk_data[ck].get("theta", 0) or 0)
-                    near_strikes.at[idx, "call_iv"] = float(gk_data[ck].get("iv", 0) or 0)
-                    near_strikes.at[idx, "call_gamma"] = float(gk_data[ck].get("gamma", 0) or 0)
-                    near_strikes.at[idx, "call_vega"] = float(gk_data[ck].get("vega", 0) or 0)
-                if pk in gk_data:
-                    near_strikes.at[idx, "put_delta"] = float(gk_data[pk].get("delta", 0) or 0)
-                    near_strikes.at[idx, "put_theta"] = float(gk_data[pk].get("theta", 0) or 0)
-                    near_strikes.at[idx, "put_iv"] = float(gk_data[pk].get("iv", 0) or 0)
-                    near_strikes.at[idx, "put_gamma"] = float(gk_data[pk].get("gamma", 0) or 0)
-                    near_strikes.at[idx, "put_vega"] = float(gk_data[pk].get("vega", 0) or 0)
-
-    # 3. Black-Scholes Fallback if API returns 0
-    exp_date = dt.datetime.strptime(opt_expiry, "%Y-%m-%d").date()
-    days_to_expiry = max((exp_date - today).days, 1)
-    t = days_to_expiry / 365.0
-    r = 0.07
-    vol = 0.25 # Assume 25% IV
-
-    for idx, row in near_strikes.iterrows():
-        s = float(row["strike"])
-        if near_strikes.at[idx, "call_delta"] == 0:
-            cd, cg, ct, cv, civ = calculate_greeks(spot, s, t, r, vol, "CE")
-            near_strikes.at[idx, "call_delta"] = float(cd)
-            near_strikes.at[idx, "call_gamma"] = float(cg)
-            near_strikes.at[idx, "call_theta"] = float(ct)
-            near_strikes.at[idx, "call_vega"] = float(cv)
-            near_strikes.at[idx, "call_iv"] = float(civ)
-
-        if near_strikes.at[idx, "put_delta"] == 0:
-            pd, pg, pt, pv, piv = calculate_greeks(spot, s, t, r, vol, "PE")
-            near_strikes.at[idx, "put_delta"] = float(pd)
-            near_strikes.at[idx, "put_gamma"] = float(pg)
-            near_strikes.at[idx, "put_theta"] = float(pt)
-            near_strikes.at[idx, "put_vega"] = float(pv)
-            near_strikes.at[idx, "put_iv"] = float(piv)
-
     ce_atm = near_strikes[near_strikes["strike"] == atm_strike]
     ce_atm = ce_atm.iloc[0] if not ce_atm.empty else None
     
