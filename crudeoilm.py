@@ -417,7 +417,7 @@ def compute_master_confluence(price, chain, ds, macro):
             if adjusted > price["pct"]: wti_score = 1.0
             elif adjusted < price["pct"]: wti_score = -1.0
 
-    # STRICT VETO LOGIC (No Weighted Averages)
+    # STRICT VETO LOGIC
     decision, reason = "NO TRADE", "Indicators mixed."
     
     if oi_score > 0.2 and vol_score > 0 and pa_score > 0:
@@ -513,6 +513,83 @@ st.markdown(f'''
 </div>
 ''', unsafe_allow_html=True)
 
+# ==============================
+# NEW: MOMENTUM OI SCANNER
+# ==============================
+st.markdown("### 🚀 Momentum OI Scanner (ATM ± 2 Strikes)")
+st.markdown("Calculates the **Dominance %** of Put writing vs Call writing. A sudden surge > 60% or drop < 40% indicates a high-probability directional breakout.")
+
+if chain is not None and not chain.empty:
+    d = chain[chain["has_chg"]].copy()
+    strikes = sorted(d["strike"].unique())
+    if strikes:
+        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        atm_idx = strikes.index(atm_strike)
+        
+        # Get 2 strikes up and down
+        start_idx = max(0, atm_idx - 2)
+        end_idx = min(len(strikes), atm_idx + 3)
+        near_strikes = strikes[start_idx:end_idx]
+        
+        mom_rows = []
+        for s in near_strikes:
+            row = d[d["strike"] == s].iloc[0]
+            c_chg = row["call_chg"]
+            p_chg = row["put_chg"]
+            
+            # Calculate dominance %
+            total_chg = abs(c_chg) + abs(p_chg)
+            if total_chg > 0:
+                put_dom = (abs(p_chg) / total_chg) * 100
+            else:
+                put_dom = 50.0
+                
+            # Signal Logic
+            if put_dom >= 60:
+                signal = "🔥 STRONG BULLISH (Put Writing)"
+                color = "green"
+            elif put_dom <= 40:
+                signal = "🔥 STRONG BEARISH (Call Writing)"
+                color = "red"
+            else:
+                signal = "Neutral / Mixed"
+                color = "black"
+                
+            type_str = "ATM" if s == atm_strike else ("ITM" if s < atm_strike else "OTM")
+            
+            mom_rows.append({
+                "Strike": s,
+                "Type": type_str,
+                "Call ΔOI": f"{c_chg:+,.0f}",
+                "Put ΔOI": f"{p_chg:+,.0f}",
+                "Put Dominance %": f"{put_dom:.1f}%",
+                "Momentum Signal": signal,
+                "color": color
+            })
+            
+        mom_df = pd.DataFrame(mom_rows)
+        
+        # Function to color the signal text
+        def color_signal(val):
+            if "BULLISH" in val: return 'color: green; font-weight: bold;'
+            if "BEARISH" in val: return 'color: red; font-weight: bold;'
+            return 'color: gray;'
+            
+        st.dataframe(mom_df.style.applymap(color_signal, subset=["Momentum Signal"]).format({"Strike": "{:.2f}"}), use_container_width=True)
+        
+        # Quick alert if any strike has > 60% dominance
+        for _, r in mom_df.iterrows():
+            if "BULLISH" in r["Momentum Signal"]:
+                st.success(f"🚨 **Immediate Move Alert**: Strike {r['Strike']} has {r['Put Dominance %']} Put writing dominance. Expect an upward thrust.")
+            elif "BEARISH" in r["Momentum Signal"]:
+                st.error(f"🚨 **Immediate Move Alert**: Strike {r['Strike']} has {r['Put Dominance %']} Call writing dominance. Expect a downward thrust.")
+            
+    else:
+        st.info("No strike data available for momentum scan.")
+else:
+    st.warning("Option Chain data not available.")
+
+st.markdown("---")
 
 # Option Greeks (ATM Window) - SAFE VERSION (NO FALLBACK)
 st.markdown("### 📊 Option Greeks (ATM Window)")
