@@ -24,7 +24,7 @@ now = dt.datetime.now(IST)
 today = now.date()
 
 # ==============================
-# CSS STYLES (Nifty Ecosystem Style)
+# CSS STYLES
 # ==============================
 st.markdown("""
 <style>
@@ -514,7 +514,7 @@ st.markdown(f'''
 ''', unsafe_allow_html=True)
 
 # ==============================
-# NEW: MOMENTUM OI SCANNER
+# NEW: MOMENTUM OI SCANNER (FIXED)
 # ==============================
 st.markdown("### 🚀 Momentum OI Scanner (ATM ± 2 Strikes)")
 st.markdown("Calculates the **Dominance %** of Put writing vs Call writing. A sudden surge > 60% or drop < 40% indicates a high-probability directional breakout.")
@@ -526,7 +526,6 @@ if chain is not None and not chain.empty:
         atm_strike = min(strikes, key=lambda s: abs(s - spot))
         atm_idx = strikes.index(atm_strike)
         
-        # Get 2 strikes up and down
         start_idx = max(0, atm_idx - 2)
         end_idx = min(len(strikes), atm_idx + 3)
         near_strikes = strikes[start_idx:end_idx]
@@ -537,23 +536,18 @@ if chain is not None and not chain.empty:
             c_chg = row["call_chg"]
             p_chg = row["put_chg"]
             
-            # Calculate dominance %
             total_chg = abs(c_chg) + abs(p_chg)
             if total_chg > 0:
                 put_dom = (abs(p_chg) / total_chg) * 100
             else:
                 put_dom = 50.0
                 
-            # Signal Logic
             if put_dom >= 60:
                 signal = "🔥 STRONG BULLISH (Put Writing)"
-                color = "green"
             elif put_dom <= 40:
                 signal = "🔥 STRONG BEARISH (Call Writing)"
-                color = "red"
             else:
                 signal = "Neutral / Mixed"
-                color = "black"
                 
             type_str = "ATM" if s == atm_strike else ("ITM" if s < atm_strike else "OTM")
             
@@ -564,20 +558,27 @@ if chain is not None and not chain.empty:
                 "Put ΔOI": f"{p_chg:+,.0f}",
                 "Put Dominance %": f"{put_dom:.1f}%",
                 "Momentum Signal": signal,
-                "color": color
             })
             
         mom_df = pd.DataFrame(mom_rows)
         
-        # Function to color the signal text
         def color_signal(val):
+            if not isinstance(val, str): return ''
             if "BULLISH" in val: return 'color: green; font-weight: bold;'
             if "BEARISH" in val: return 'color: red; font-weight: bold;'
             return 'color: gray;'
             
-        st.dataframe(mom_df.style.applymap(color_signal, subset=["Momentum Signal"]).format({"Strike": "{:.2f}"}), use_container_width=True)
+        # SAFE RENDERING FOR PANDAS VERSION COMPATIBILITY
+        try:
+            # Try newer Pandas .map()
+            styled_df = mom_df.style.map(color_signal, subset=["Momentum Signal"])
+        except AttributeError:
+            # Fallback to older Pandas .applymap()
+            styled_df = mom_df.style.applymap(color_signal, subset=["Momentum Signal"])
+            
+        st.dataframe(styled_df.format({"Strike": "{:.2f}"}), use_container_width=True)
         
-        # Quick alert if any strike has > 60% dominance
+        # Quick alert logic
         for _, r in mom_df.iterrows():
             if "BULLISH" in r["Momentum Signal"]:
                 st.success(f"🚨 **Immediate Move Alert**: Strike {r['Strike']} has {r['Put Dominance %']} Put writing dominance. Expect an upward thrust.")
@@ -591,7 +592,7 @@ else:
 
 st.markdown("---")
 
-# Option Greeks (ATM Window) - SAFE VERSION (NO FALLBACK)
+# Option Greeks (ATM Window) - SAFE VERSION
 st.markdown("### 📊 Option Greeks (ATM Window)")
 if chain is not None and not chain.empty:
     atm_strike = ds["atm"] if ds else 0
