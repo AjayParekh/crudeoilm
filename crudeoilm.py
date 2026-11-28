@@ -417,14 +417,15 @@ def compute_master_confluence(price, chain, ds, macro):
             if adjusted > price["pct"]: wti_score = 1.0
             elif adjusted < price["pct"]: wti_score = -1.0
 
-    final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (wti_score * 0.2)
-
-    # UPDATED LOGIC: NIFTY STYLE THRESHOLD
+    # STRICT VETO LOGIC (No Weighted Averages)
     decision, reason = "NO TRADE", "Indicators mixed."
-    if final_score > 0.3:
-        decision, reason = "CONFIRM BUY", "Overall bias is strongly positive."
-    elif final_score < -0.3:
-        decision, reason = "CONFIRM SELL", "Overall bias is strongly negative."
+    
+    if oi_score > 0.2 and vol_score > 0 and pa_score > 0:
+        decision, reason = "CONFIRM BUY", "Bullish OI + Vol + PA align."
+    elif oi_score < -0.2 and vol_score < 0 and pa_score < 0:
+        decision, reason = "CONFIRM SELL", "Bearish OI + Vol + PA align."
+
+    final_score = (oi_score * 0.3) + (vol_score * 0.2) + (pa_score * 0.3) + (wti_score * 0.2)
 
     return {"decision": decision, "reason": reason, "final_score": final_score, "oi_score": oi_score, "vol_score": vol_score, "pa_score": pa_score, "wti_score": wti_score}
 
